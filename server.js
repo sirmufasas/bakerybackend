@@ -1,22 +1,7 @@
-/**
- Backend Server - MongoDB Version
- * Deploy this on Render.com with MongoDB Atlas
- * 
- * Environment Variables Required:
- * - PORT=3001
- * - MONGODB_URI=mongodb+srv://user:pass@cluster.mongodb.net/orderManagementDB
- * - STRIPE_SECRET_KEY=sk_...
- * - STRIPE_WEBHOOK_SECRET=whsec_...
- * - RESEND_API_KEY=re_...
- * - FRONTEND_URL=https://yoursite.com
- * - JWT_SECRET=your-secret-key
- * - ADMIN_EMAIL=admin@yourdomain.com
- * - NODE_ENV=production
- */
+require('dotenv').config();
 
 const express = require('express');
 const cors = require('cors');
-const Stripe = require('stripe');
 const { Resend } = require('resend');
 const { MongoClient, ObjectId } = require('mongodb');
 const jwt = require('jsonwebtoken');
@@ -24,6 +9,7 @@ const bcrypt = require('bcrypt');
 const rateLimit = require('express-rate-limit');
 const helmet = require('helmet');
 const { body, param, query, validationResult } = require('express-validator');
+// const { Yoco } = require('@lekkercommerce/yoco-node');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -31,7 +17,7 @@ const PORT = process.env.PORT || 3001;
 // ============================================
 // ENVIRONMENT VALIDATION
 // ============================================
-const requiredEnvVars = ['STRIPE_SECRET_KEY', 'RESEND_API_KEY', 'MONGODB_URI', 'FRONTEND_URL', 'JWT_SECRET'];
+const requiredEnvVars = ['RESEND_API_KEY', 'MONGODB_URI', 'FRONTEND_URL', 'JWT_SECRET'];
 
 requiredEnvVars.forEach(varName => {
   if (!process.env[varName]) {
@@ -45,14 +31,19 @@ console.log('✅ Environment variables validated');
 // ============================================
 // INITIALIZE SERVICES
 // ============================================
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
+// const yoco = new Yoco({ apiKey: process.env.YOCO_SECRET_KEY });
 const resend = new Resend(process.env.RESEND_API_KEY);
 
 let db, mongoClient;
 
 const connectDB = async () => {
   try {
-    mongoClient = new MongoClient(process.env.MONGODB_URI);
+    mongoClient = new MongoClient(process.env.MONGODB_URI, {
+      useUnifiedTopology: true,
+      tls: true,
+      tlsAllowInvalidCertificates: false, // true only for testing
+      serverSelectionTimeoutMS: 10000
+    });
     await mongoClient.connect();
     db = mongoClient.db('orderManagementDB');
     console.log('✅ MongoDB connected');
@@ -62,6 +53,7 @@ const connectDB = async () => {
     process.exit(1);
   }
 };
+
 
 const createIndexes = async () => {
   try {
@@ -88,28 +80,6 @@ app.use(helmet());
 
 const apiLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 100 });
 const strictLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 10 });
-
-// Stripe webhook - MUST be before express.json()
-app.post('/api/webhooks/stripe', express.raw({ type: 'application/json' }), async (req, res) => {
-  const sig = req.headers['stripe-signature'];
-  try {
-    const event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
-    if (event.type === 'payment_intent.succeeded') {
-      const pi = event.data.object;
-      await db.collection('orders').updateOne(
-        { orderNumber: pi.metadata.order_number },
-        { $set: { paymentStatus: 'paid', paymentIntentId: pi.id, updatedAt: new Date() }}
-      );
-      const order = await db.collection('orders').findOne({ orderNumber: pi.metadata.order_number });
-      if (order) await sendOrderConfirmationEmail(order);
-      console.log('✅ Payment success:', pi.metadata.order_number);
-    }
-    res.json({ received: true });
-  } catch (error) {
-    console.error('❌ Webhook error:', error.message);
-    res.status(400).json({ error: 'Webhook error' });
-  }
-});
 
 app.use(cors({ origin: process.env.FRONTEND_URL || '*', credentials: true }));
 app.use(express.json({ limit: '10mb' }));
@@ -190,87 +160,42 @@ app.get('/health', async (req, res) => {
 });
 
 // ============================================
-// AUTH ENDPOINTS
+// PAYMENT ENDPOINTS (Yoco)
 // ============================================
-app.post('/api/auth/signup', strictLimiter, [
-  body('email').isEmail().normalizeEmail(),
-  body('password').isLength({ min: 8 }),
-  body('firstName').trim().notEmpty(),
-  body('lastName').trim().notEmpty()
-], validate, async (req, res) => {
-  try {
-    const { email, password, firstName, lastName, phone } = req.body;
-    if (await db.collection('users').findOne({ email })) {
-      return res.status(400).json({ error: 'Email exists' });
-    }
-    const hashedPassword = await bcrypt.hash(password, 10);
-    const result = await db.collection('users').insertOne({
-      email, password: hashedPassword, firstName, lastName, phone: phone || '',
-      role: 'customer', createdAt: new Date(), lastLogin: new Date()
-    });
-    const token = jwt.sign({ userId: result.insertedId.toString(), role: 'customer' }, process.env.JWT_SECRET, { expiresIn: '7d' });
-    res.json({ token, user: { id: result.insertedId, email, firstName, lastName, role: 'customer' }});
-  } catch (error) {
-    handleError(res, error, 'Signup failed');
-  }
-});
+// app.post('/api/payments/create-yoco', authenticateToken, [
+//   body('amount').isFloat({ min: 0.5 }),
+//   body('orderNumber').notEmpty()
+// ], validate, async (req, res) => {
+//   try {
+//     const { amount, orderNumber } = req.body;
+//     const payment = await yoco.payments.create({
+//       amountInCents: Math.round(amount * 100),
+//       currency: 'ZAR',
+//       reference: orderNumber
+//     });
+//     res.json({ paymentLink: payment.paymentLink, paymentId: payment.id });
+//   } catch (error) {
+//     handleError(res, error, 'Yoco payment creation failed');
+//   }
+// });
 
-app.post('/api/auth/login', strictLimiter, [
-  body('email').isEmail().normalizeEmail(),
-  body('password').notEmpty()
-], validate, async (req, res) => {
-  try {
-    const { email, password } = req.body;
-    const user = await db.collection('users').findOne({ email });
-    if (!user || !(await bcrypt.compare(password, user.password))) {
-      return res.status(401).json({ error: 'Invalid credentials' });
-    }
-    await db.collection('users').updateOne({ _id: user._id }, { $set: { lastLogin: new Date() }});
-    const token = jwt.sign({ userId: user._id.toString(), role: user.role }, process.env.JWT_SECRET, { expiresIn: '7d' });
-    res.json({ token, user: { id: user._id, email: user.email, firstName: user.firstName, lastName: user.lastName, role: user.role }});
-  } catch (error) {
-    handleError(res, error, 'Login failed');
-  }
-});
-
-app.get('/api/auth/me', authenticateToken, (req, res) => res.json({ user: req.user }));
-
-app.post('/api/auth/change-password', authenticateToken, [
-  body('currentPassword').notEmpty(),
-  body('newPassword').isLength({ min: 8 })
-], validate, async (req, res) => {
-  try {
-    const { currentPassword, newPassword } = req.body;
-    const user = await db.collection('users').findOne({ _id: req.user._id });
-    if (!(await bcrypt.compare(currentPassword, user.password))) {
-      return res.status(401).json({ error: 'Wrong password' });
-    }
-    await db.collection('users').updateOne({ _id: req.user._id }, { $set: { password: await bcrypt.hash(newPassword, 10) }});
-    res.json({ message: 'Password updated' });
-  } catch (error) {
-    handleError(res, error, 'Password change failed');
-  }
-});
-
-// ============================================
-// PAYMENT ENDPOINTS
-// ============================================
-app.post('/api/payments/create-intent', authenticateToken, [
-  body('amount').isFloat({ min: 0.5 }),
-  body('orderNumber').notEmpty()
-], validate, async (req, res) => {
-  try {
-    const { amount, currency = 'eur', orderNumber } = req.body;
-    const pi = await stripe.paymentIntents.create({
-      amount: Math.round(amount * 100), currency,
-      metadata: { order_number: orderNumber, customer_email: req.user.email },
-      receipt_email: req.user.email
-    });
-    res.json({ clientSecret: pi.client_secret, paymentIntentId: pi.id });
-  } catch (error) {
-    handleError(res, error, 'Payment failed');
-  }
-});
+// app.post('/api/payments/confirm-yoco', authenticateToken, [
+//   body('paymentId').notEmpty(),
+//   body('orderNumber').notEmpty()
+// ], validate, async (req, res) => {
+//   try {
+//     const { paymentId, orderNumber } = req.body;
+//     const order = await db.collection('orders').findOne({ orderNumber });
+//     if (!order) return res.status(404).json({ error: 'Order not found' });
+//     await db.collection('orders').updateOne(
+//       { orderNumber },
+//       { $set: { paymentStatus: 'paid', yocoPaymentId: paymentId, updatedAt: new Date() }}
+//     );
+//     res.json({ success: true });
+//   } catch (error) {
+//     handleError(res, error, 'Yoco payment confirmation failed');
+//   }
+// });
 
 // ============================================
 // ORDER ENDPOINTS
