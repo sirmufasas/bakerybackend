@@ -210,7 +210,7 @@ async function sendOrderConfirmationEmail(order) {
       return;
     }
 
-    const items = order.items.map(i => 
+    const items = order.items.map(i =>
       `• ${i.name} x${i.quantity} - R${(i.price * i.quantity).toFixed(2)}`
     ).join('<br>');
 
@@ -384,19 +384,19 @@ app.post('/api/auth/register', strictLimiter, [
     const token = jwt.sign({ userId: result.insertedId.toString() }, process.env.JWT_SECRET, { expiresIn: '7d' });
 
     console.log('✅ Registered:', email);
-    
+
     // ✅ FIXED: Now includes createdAt
-    res.json({ 
-      token, 
-      user: { 
-        _id: result.insertedId, 
-        email, 
-        firstName, 
-        lastName, 
-        phone, 
+    res.json({
+      token,
+      user: {
+        _id: result.insertedId,
+        email,
+        firstName,
+        lastName,
+        phone,
         role: 'customer',
         createdAt: user.createdAt  // ✅ ADDED THIS
-      } 
+      }
     });
   } catch (error) {
     handleError(res, error, 'Registration failed');
@@ -422,19 +422,19 @@ app.post('/api/auth/login', strictLimiter, [
     const token = jwt.sign({ userId: user._id.toString() }, process.env.JWT_SECRET, { expiresIn: '7d' });
 
     console.log('✅ Login:', email);
-    
+
     // ✅ FIXED: Now includes createdAt
-    res.json({ 
-      token, 
-      user: { 
-        _id: user._id, 
-        email, 
-        firstName: user.firstName, 
-        lastName: user.lastName, 
-        phone: user.phone, 
+    res.json({
+      token,
+      user: {
+        _id: user._id,
+        email,
+        firstName: user.firstName,
+        lastName: user.lastName,
+        phone: user.phone,
         role: user.role,
         createdAt: user.createdAt  // ✅ ADDED THIS
-      } 
+      }
     });
   } catch (error) {
     handleError(res, error, 'Login failed');
@@ -485,7 +485,7 @@ app.post('/api/auth/request-password-reset', strictLimiter, [
 
       const resetUrl = `${process.env.FRONTEND_URL}/reset-password?token=${resetToken}`;
 
-       // ✅ CORRECT PASSWORD RESET EMAIL
+      // ✅ CORRECT PASSWORD RESET EMAIL
       await resend.emails.send({
         from: 'Portugal Bakery <onboarding@resend.dev>',
         to: email,
@@ -665,15 +665,31 @@ app.post('/api/orders', authenticateToken, [
     order._id = result.insertedId;
 
     // Clear cart after order
-   await db.collection('carts').updateOne(
+    await db.collection('carts').updateOne(
       { userId: req.user._id },
       { $set: { items: [], updatedAt: new Date() } },
       { upsert: true }
     );
 
-    sendOrderConfirmationEmail(order).catch(e => 
+    // Send email
+    sendOrderConfirmationEmail(order).catch(e =>
       console.error('Email error:', e)
     );
+
+    // ✅ BROADCAST TO ALL ADMINS - NEW ORDER
+    broadcastToAdmins({
+      type: 'new_order',
+      order: {
+        ...order,
+        _id: order._id.toString(),
+        userId: order.userId.toString(),
+        user: [{
+          firstName: req.user.firstName,
+          lastName: req.user.lastName,
+          email: req.user.email
+        }]
+      }
+    });
 
     console.log('✅ Order created:', order.orderNumber);
     res.json(order);
@@ -719,9 +735,23 @@ app.post('/api/orders', authenticateToken, [
       { upsert: true }
     );
 
-    sendOrderConfirmationEmail(order).catch(e => 
+    sendOrderConfirmationEmail(order).catch(e =>
       console.error('Email error:', e)
     );
+    // ✅ BROADCAST TO ALL ADMINS - NEW ORDER
+    broadcastToAdmins({
+      type: 'new_order',
+      order: {
+        ...order,
+        _id: order._id.toString(),
+        userId: order.userId.toString(),
+        user: [{
+          firstName: req.user.firstName,
+          lastName: req.user.lastName,
+          email: req.user.email
+        }]
+      }
+    });
 
     console.log('✅ Order created:', order.orderNumber);
     res.json(order);
@@ -731,10 +761,8 @@ app.post('/api/orders', authenticateToken, [
 });
 
 // ==================== ORDER STATUS UPDATE ENDPOINT ====================
-// REPLACE YOUR EXISTING app.put('/api/orders/:orderNumber/status'...) WITH THIS COMPLETE VERSION
-// Place this AFTER your authenticateAdmin middleware definition
 
-app.put('/api/orders/:orderNumber/status', 
+app.put('/api/orders/:orderNumber/status',
   authenticateAdmin,
   [
     param('orderNumber').matches(/^PB-[A-Z0-9]{8}-[A-Z0-9]{4}$/),
@@ -744,9 +772,9 @@ app.put('/api/orders/:orderNumber/status',
     const errors = validationResult(req);
     if (!errors.isEmpty()) {
       console.error('❌ Validation errors:', errors.array());
-      return res.status(400).json({ 
-        error: 'Validation failed', 
-        details: errors.array() 
+      return res.status(400).json({
+        error: 'Validation failed',
+        details: errors.array()
       });
     }
     next();
@@ -763,99 +791,110 @@ app.put('/api/orders/:orderNumber/status',
       console.log('🔄 New Status:', status);
       console.log('👤 Admin:', req.user.email);
       console.log('⏰ Timestamp:', new Date().toISOString());
-      
+
       // ✅ STEP 1: Verify order exists
       console.log('\n[STEP 1] Searching for order in database...');
-      const existingOrder = await db.collection('orders').findOne({ 
-        orderNumber: orderNumber 
+      const existingOrder = await db.collection('orders').findOne({
+        orderNumber: orderNumber
       });
-      
+
       if (!existingOrder) {
         console.error('❌ Order not found in database');
         console.error('   Searched for orderNumber:', orderNumber);
-        
+
         // Debug: List all order numbers in database
         const allOrders = await db.collection('orders')
           .find({}, { projection: { orderNumber: 1 } })
           .limit(10)
           .toArray();
         console.error('   Available orders:', allOrders.map(o => o.orderNumber));
-        
-        return res.status(404).json({ 
+
+        return res.status(404).json({
           error: 'Order not found',
           orderNumber: orderNumber,
           hint: 'Check if order number format is correct'
         });
       }
-      
+
       console.log('✅ Order found!');
       console.log('   ID:', existingOrder._id);
       console.log('   Current Status:', existingOrder.status);
       console.log('   Customer ID:', existingOrder.userId);
-      
+
       // ✅ STEP 2: Perform the update
       console.log('\n[STEP 2] Updating order status...');
       const updateResult = await db.collection('orders').updateOne(
         { orderNumber: orderNumber },
-        { 
-          $set: { 
+        {
+          $set: {
             status: status,
-            updatedAt: new Date() 
-          } 
+            updatedAt: new Date()
+          }
         }
       );
-      
+
       console.log('📝 Update Result:');
       console.log('   Matched:', updateResult.matchedCount);
       console.log('   Modified:', updateResult.modifiedCount);
-      
+
       if (updateResult.matchedCount === 0) {
         console.error('❌ No documents matched - this should not happen!');
-        return res.status(500).json({ 
-          error: 'Update failed - order not matched' 
+        return res.status(500).json({
+          error: 'Update failed - order not matched'
         });
       }
-      
+
       if (updateResult.modifiedCount === 0) {
         console.warn('⚠️ No modifications made - status might already be', status);
       } else {
         console.log('✅ Order updated successfully!');
       }
-      
+
       // ✅ STEP 3: Fetch the updated order
       console.log('\n[STEP 3] Fetching updated order...');
-      const updatedOrder = await db.collection('orders').findOne({ 
-        orderNumber: orderNumber 
+      const updatedOrder = await db.collection('orders').findOne({
+        orderNumber: orderNumber
       });
-      
+
       if (!updatedOrder) {
         console.error('❌ Failed to retrieve updated order');
-        return res.status(500).json({ 
+        return res.status(500).json({
           error: 'Update succeeded but failed to retrieve updated order'
         });
       }
-      
+
       console.log('✅ Retrieved updated order');
       console.log('   New Status:', updatedOrder.status);
       console.log('   Updated At:', updatedOrder.updatedAt);
-      
+
       // ✅ STEP 4: Send email notification (non-blocking)
       console.log('\n[STEP 4] Sending email notification...');
       sendOrderStatusEmail(updatedOrder)
         .then(() => console.log('✅ Email sent successfully'))
         .catch(e => console.error('⚠️ Email failed:', e.message));
 
-      // ✅ STEP 5: Prepare and send response
-      console.log('\n[STEP 5] Preparing response...');
+      // ✅ STEP 5: BROADCAST TO CUSTOMER VIA SSE (NEW!)
+      console.log('\n[STEP 5] Broadcasting status change to customer via SSE...');
+      broadcastToCustomer(updatedOrder.userId, {
+        type: 'order_status_changed',
+        order: {
+          orderNumber: updatedOrder.orderNumber,
+          status: updatedOrder.status,
+          updatedAt: updatedOrder.updatedAt
+        }
+      });
+
+      // ✅ STEP 6: Prepare and send response
+      console.log('\n[STEP 6] Preparing response...');
       const responseOrder = {
         ...updatedOrder,
         _id: updatedOrder._id.toString(),
         userId: updatedOrder.userId.toString()
       };
-      
+
       console.log('✅ Sending 200 OK response');
       console.log('═══════════════════════════════════════════════\n');
-      
+
       res.status(200).json(responseOrder);
 
     } catch (error) {
@@ -865,16 +904,16 @@ app.put('/api/orders/:orderNumber/status',
       console.error('❌ Error:', error.message);
       console.error('📚 Stack:', error.stack);
       console.error('═══════════════════════════════════════════════\n');
-      
+
       // Provide detailed error info
       if (error.name === 'ValidationError') {
-        return res.status(400).json({ 
+        return res.status(400).json({
           error: 'Validation failed',
-          details: error.message 
+          details: error.message
         });
       }
-      
-      res.status(500).json({ 
+
+      res.status(500).json({
         error: 'Failed to update order status',
         message: error.message,
         orderNumber: req.params.orderNumber
@@ -882,6 +921,171 @@ app.put('/api/orders/:orderNumber/status',
     }
   }
 );
+
+const sseClients = {
+  admin: new Set(),
+  customers: new Map() // Map<userId, Set<response>>
+};
+
+// Special SSE authentication that accepts token from query or header
+const authenticateSSE = async (req, res, next) => {
+  try {
+    let token = req.query.token;
+
+    if (!token) {
+      const authHeader = req.headers.authorization;
+      if (authHeader?.startsWith('Bearer ')) {
+        token = authHeader.split(' ')[1];
+      }
+    }
+
+    if (!token) {
+      return res.status(401).json({ error: 'No token provided' });
+    }
+
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    const user = await db.collection('users').findOne(
+      { _id: new ObjectId(decoded.userId) },
+      { projection: { password: 0 } }
+    );
+
+    if (!user) return res.status(401).json({ error: 'User not found' });
+    req.user = user;
+    next();
+  } catch (error) {
+    res.status(401).json({ error: 'Invalid token' });
+  }
+};
+
+// SSE endpoint for admins
+app.get('/api/sse/admin', authenticateSSE, (req, res) => {
+  if (req.user.role !== 'admin') {
+    return res.status(403).json({ error: 'Admin access required' });
+  }
+
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
+
+  res.write('data: {"type":"connected","message":"Admin SSE connected"}\n\n');
+
+  sseClients.admin.add(res);
+  console.log('✅ Admin SSE connected:', req.user.email, 'Active:', sseClients.admin.size);
+
+  req.on('close', () => {
+    sseClients.admin.delete(res);
+    console.log('❌ Admin SSE disconnected:', req.user.email);
+  });
+});
+
+// SSE endpoint for customers
+app.get('/api/sse/customer', authenticateSSE, (req, res) => {
+  const userId = req.user._id.toString();
+
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
+
+  res.write('data: {"type":"connected","message":"Customer SSE connected"}\n\n');
+
+  if (!sseClients.customers.has(userId)) {
+    sseClients.customers.set(userId, new Set());
+  }
+  sseClients.customers.get(userId).add(res);
+  console.log('✅ Customer SSE connected:', req.user.email);
+
+  req.on('close', () => {
+    const userClients = sseClients.customers.get(userId);
+    if (userClients) {
+      userClients.delete(res);
+      if (userClients.size === 0) {
+        sseClients.customers.delete(userId);
+      }
+    }
+    console.log('❌ Customer SSE disconnected:', req.user.email);
+  });
+});
+
+// SSE endpoint for customers (get notified of order status changes)
+app.get('/api/sse/customer', authenticateToken, (req, res) => {
+  const userId = req.user._id.toString();
+
+  // Set SSE headers
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
+
+  // Send initial connection message
+  res.write('data: {"type":"connected","message":"Customer SSE connected"}\n\n');
+
+  // Add this client to customer clients
+  if (!sseClients.customers.has(userId)) {
+    sseClients.customers.set(userId, new Set());
+  }
+  sseClients.customers.get(userId).add(res);
+  console.log('✅ Customer SSE connected:', req.user.email);
+
+  // Cleanup on disconnect
+  req.on('close', () => {
+    const userClients = sseClients.customers.get(userId);
+    if (userClients) {
+      userClients.delete(res);
+      if (userClients.size === 0) {
+        sseClients.customers.delete(userId);
+      }
+    }
+    console.log('❌ Customer SSE disconnected:', req.user.email);
+  });
+});
+
+// Helper function to broadcast to all admin clients
+function broadcastToAdmins(data) {
+  const message = `data: ${JSON.stringify(data)}\n\n`;
+  let sent = 0;
+
+  sseClients.admin.forEach(client => {
+    try {
+      client.write(message);
+      sent++;
+    } catch (err) {
+      console.error('Failed to send to admin client:', err.message);
+      sseClients.admin.delete(client);
+    }
+  });
+
+  if (sent > 0) {
+    console.log(`📡 Broadcast to ${sent} admin(s):`, data.type);
+  }
+}
+
+// Helper function to broadcast to specific customer
+function broadcastToCustomer(userId, data) {
+  const userIdStr = userId.toString();
+  const clients = sseClients.customers.get(userIdStr);
+
+  if (!clients || clients.size === 0) {
+    console.log(`📡 No SSE clients for user ${userIdStr}`);
+    return;
+  }
+
+  const message = `data: ${JSON.stringify(data)}\n\n`;
+  let sent = 0;
+
+  clients.forEach(client => {
+    try {
+      client.write(message);
+      sent++;
+    } catch (err) {
+      console.error('Failed to send to customer client:', err.message);
+      clients.delete(client);
+    }
+  });
+
+  console.log(`📡 Broadcast to ${sent} client(s) for user ${userIdStr}:`, data.type);
+}
 
 // Get all orders (Admin only) with user details
 app.get('/api/orders', authenticateAdmin, async (req, res) => {
@@ -914,7 +1118,7 @@ app.get('/api/orders', authenticateAdmin, async (req, res) => {
     ]).toArray();
 
     console.log('📦 Fetched orders:', orders.length);
-    
+
     // Return as direct array, not wrapped in object
     res.json(orders);
   } catch (error) {
@@ -941,7 +1145,7 @@ app.get('/api/orders/my-orders', authenticateToken, async (req, res) => {
 app.get('/api/orders/:orderNumber', authenticateToken, async (req, res) => {
   try {
     const order = await db.collection('orders').findOne({ orderNumber: req.params.orderNumber });
-    
+
     if (!order) {
       return res.status(404).json({ error: 'Order not found' });
     }
@@ -950,6 +1154,20 @@ app.get('/api/orders/:orderNumber', authenticateToken, async (req, res) => {
     if (req.user.role !== 'admin' && order.userId.toString() !== req.user._id.toString()) {
       return res.status(403).json({ error: 'Access denied' });
     }
+    // ✅ BROADCAST TO ALL ADMINS - NEW ORDER
+    broadcastToAdmins({
+      type: 'new_order',
+      order: {
+        ...order,
+        _id: order._id.toString(),
+        userId: order.userId.toString(),
+        user: [{
+          firstName: req.user.firstName,
+          lastName: req.user.lastName,
+          email: req.user.email
+        }]
+      }
+    });
 
     res.json(order);
   } catch (error) {
@@ -1138,7 +1356,7 @@ app.delete('/api/products/:id', /* authenticateAdmin, */ validateProductId, vali
     console.log('🗑️ DELETE request for product ID:', paramId);
 
     let query;
-    
+
     // Try numeric id first (most common)
     if (!isNaN(Number(paramId)) && Number(paramId) > 0) {
       query = { id: Number(paramId) };
@@ -1148,7 +1366,7 @@ app.delete('/api/products/:id', /* authenticateAdmin, */ validateProductId, vali
     else if (ObjectId.isValid(paramId) && paramId.length === 24) {
       query = { _id: new ObjectId(paramId) };
       console.log('🔍 Delete query: { _id: ObjectId("' + paramId + '") }');
-    } 
+    }
     else {
       console.error('❌ Invalid product ID format:', paramId);
       return res.status(400).json({ error: 'Invalid product ID format' });
@@ -1165,14 +1383,14 @@ app.delete('/api/products/:id', /* authenticateAdmin, */ validateProductId, vali
 
     // Perform deletion
     const result = await db.collection('products').deleteOne(query);
-    
+
     if (result.deletedCount === 0) {
       console.error('❌ Delete operation failed - no documents deleted');
       return res.status(500).json({ error: 'Failed to delete product' });
     }
 
     console.log('✅ Product deleted successfully:', existingProduct.name, 'ID:', existingProduct.id);
-    
+
     res.json({
       message: 'Product deleted successfully',
       product: serializeProduct(existingProduct)
