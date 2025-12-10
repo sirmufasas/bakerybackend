@@ -62,8 +62,8 @@ const createIndexes = async () => {
     await db.collection('orders').createIndex({ orderNumber: 1 }, { unique: true });
     await db.collection('orders').createIndex({ status: 1 });
     await db.collection('orders').createIndex({ createdAt: -1 });
-    // await db.collection('testimonials').createIndex({ userId: 1 });
-    // await db.collection('testimonials').createIndex({ isApproved: 1 });
+    await db.collection('support_messages').createIndex({ userId: 1 });
+    await db.collection('support_messages').createIndex({ createdAt: -1 });
     await db.collection('messages').createIndex({ orderId: 1 });
     await db.collection('messages').createIndex({ toUserId: 1 });
     await db.collection('carts').createIndex({ userId: 1 }, { unique: true }); // NEW: Cart index
@@ -169,6 +169,35 @@ const generateOrderNumber = () => {
   const timestamp = Date.now().toString(36).toUpperCase();
   const random = Math.random().toString(36).substr(2, 4).toUpperCase();
   return `PB-${timestamp}-${random}`;
+};
+
+const authenticateSSE = async (req, res, next) => {
+  try {
+    let token = req.query.token;
+
+    if (!token) {
+      const authHeader = req.headers.authorization;
+      if (authHeader?.startsWith('Bearer ')) {
+        token = authHeader.split(' ')[1];
+      }
+    }
+
+    if (!token) {
+      return res.status(401).json({ error: 'No token provided' });
+    }
+
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    const user = await db.collection('users').findOne(
+      { _id: new ObjectId(decoded.userId) },
+      { projection: { password: 0 } }
+    );
+
+    if (!user) return res.status(401).json({ error: 'User not found' });
+    req.user = user;
+    next();
+  } catch (error) {
+    res.status(401).json({ error: 'Invalid token' });
+  }
 };
 
 // ADD THIS FUNCTION HERE:
@@ -400,6 +429,346 @@ app.post('/api/auth/register', strictLimiter, [
     });
   } catch (error) {
     handleError(res, error, 'Registration failed');
+  }
+});
+
+const supportChatClients = {
+  customers: new Map(), // Map<userId, Set<response>>
+  admins: new Set()
+};
+
+// SSE endpoint for support chat (customers)
+app.get('/api/sse/support-chat', authenticateSSE, (req, res) => {
+  const userId = req.user._id.toString();
+
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
+
+  res.write('data: {"type":"connected","message":"Support chat SSE connected"}\n\n');
+
+  if (!supportChatClients.customers.has(userId)) {
+    supportChatClients.customers.set(userId, new Set());
+  }
+  supportChatClients.customers.get(userId).add(res);
+  console.log('✅ Customer support chat SSE connected:', req.user.email);
+
+  req.on('close', () => {
+    const userClients = supportChatClients.customers.get(userId);
+    if (userClients) {
+      userClients.delete(res);
+      if (userClients.size === 0) {
+        supportChatClients.customers.delete(userId);
+      }
+    }
+    console.log('❌ Customer support chat SSE disconnected:', req.user.email);
+  });
+});
+
+// SSE endpoint for admin support chat
+app.get('/api/sse/admin-support', authenticateSSE, (req, res) => {
+  if (req.user.role !== 'admin') {
+    return res.status(403).json({ error: 'Admin access required' });
+  }
+
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
+
+  res.write('data: {"type":"connected","message":"Admin support chat SSE connected"}\n\n');
+
+  supportChatClients.admins.add(res);
+  console.log('✅ Admin support chat SSE connected:', req.user.email, 'Active:', supportChatClients.admins.size);
+
+  req.on('close', () => {
+    supportChatClients.admins.delete(res);
+    console.log('❌ Admin support chat SSE disconnected:', req.user.email);
+  });
+});
+
+// Helper function to broadcast to specific customer in support chat
+function broadcastToCustomerSupport(userId, data) {
+  const userIdStr = userId.toString();
+  const clients = supportChatClients.customers.get(userIdStr);
+
+  if (!clients || clients.size === 0) {
+    console.log(`📡 No support chat SSE clients for user ${userIdStr}`);
+    return;
+  }
+
+  const message = `data: ${JSON.stringify(data)}\n\n`;
+  let sent = 0;
+
+  clients.forEach(client => {
+    try {
+      client.write(message);
+      sent++;
+    } catch (err) {
+      console.error('Failed to send to customer support client:', err.message);
+      clients.delete(client);
+    }
+  });
+
+  console.log(`📡 Broadcast to ${sent} support client(s) for user ${userIdStr}:`, data.type);
+}
+
+// Helper function to broadcast to all admins in support chat
+function broadcastToAdminsSupport(data) {
+  const message = `data: ${JSON.stringify(data)}\n\n`;
+  let sent = 0;
+
+  supportChatClients.admins.forEach(client => {
+    try {
+      client.write(message);
+      sent++;
+    } catch (err) {
+      console.error('Failed to send to admin support client:', err.message);
+      supportChatClients.admins.delete(client);
+    }
+  });
+
+  if (sent > 0) {
+    console.log(`📡 Broadcast to ${sent} admin support client(s):`, data.type);
+  }
+}
+
+// Get time-based greeting
+function getTimeBasedGreeting() {
+  const hour = new Date().getHours();
+  if (hour >= 5 && hour < 12) return "Good morning";
+  if (hour >= 12 && hour < 17) return "Good afternoon";
+  return "Good evening";
+}
+
+// Send support message (customer to admin or admin to customer)
+app.post('/api/support/send', authenticateToken, [
+  body('message').trim().notEmpty().isLength({ max: 5000 })
+], validate, async (req, res) => {
+  try {
+    const { message } = req.body;
+    const isAdmin = req.user.role === 'admin';
+
+    // If customer is sending message
+    if (!isAdmin) {
+      // Check if this is their first message
+      const existingMessages = await db.collection('support_messages').countDocuments({
+        userId: req.user._id
+      });
+
+      const isFirstMessage = existingMessages === 0;
+
+      // Create user message
+      const userMessage = {
+        userId: req.user._id,
+        fromUserId: req.user._id,
+        toUserId: null, // null means to all admins
+        message,
+        fromUserName: `${req.user.firstName} ${req.user.lastName}`,
+        isFromAdmin: false,
+        isAutoReply: false,
+        createdAt: new Date()
+      };
+
+      const userResult = await db.collection('support_messages').insertOne(userMessage);
+      userMessage._id = userResult.insertedId;
+
+      // Broadcast to all admins
+      broadcastToAdminsSupport({
+        type: 'new_support_message',
+        message: {
+          ...userMessage,
+          _id: userMessage._id.toString(),
+          userId: userMessage.userId.toString(),
+          fromUserId: userMessage.fromUserId.toString()
+        }
+      });
+
+      // If first message, send auto-reply
+      if (isFirstMessage) {
+        const greeting = getTimeBasedGreeting();
+        const autoReplyText = `${greeting} ${req.user.firstName} ${req.user.lastName}, thank you for messaging us! We will be getting back to you shortly. Feel free to explore the site whilst we get an admin to respond to your message.`;
+
+        const autoReply = {
+          userId: req.user._id,
+          fromUserId: null, // null means from system/admin
+          toUserId: req.user._id,
+          message: autoReplyText,
+          fromUserName: 'Portugal Bakery Support',
+          isFromAdmin: true,
+          isAutoReply: true,
+          createdAt: new Date()
+        };
+
+        const autoReplyResult = await db.collection('support_messages').insertOne(autoReply);
+        autoReply._id = autoReplyResult.insertedId;
+
+        console.log('✅ Auto-reply sent to customer:', req.user.email);
+
+        res.json({
+          userMessage: {
+            ...userMessage,
+            _id: userMessage._id.toString(),
+            userId: userMessage.userId.toString(),
+            fromUserId: userMessage.fromUserId.toString()
+          },
+          autoReply: {
+            ...autoReply,
+            _id: autoReply._id.toString(),
+            userId: autoReply.userId.toString(),
+            toUserId: autoReply.toUserId.toString()
+          }
+        });
+      } else {
+        res.json({
+          userMessage: {
+            ...userMessage,
+            _id: userMessage._id.toString(),
+            userId: userMessage.userId.toString(),
+            fromUserId: userMessage.fromUserId.toString()
+          }
+        });
+      }
+
+    } else {
+      // Admin is sending message - needs recipientId
+      const { recipientId } = req.body;
+
+      if (!recipientId) {
+        return res.status(400).json({ error: 'recipientId required for admin messages' });
+      }
+
+      const adminMessage = {
+        userId: new ObjectId(recipientId),
+        fromUserId: req.user._id,
+        toUserId: new ObjectId(recipientId),
+        message,
+        fromUserName: `${req.user.firstName} ${req.user.lastName} (Admin)`,
+        isFromAdmin: true,
+        isAutoReply: false,
+        createdAt: new Date()
+      };
+
+      const result = await db.collection('support_messages').insertOne(adminMessage);
+      adminMessage._id = result.insertedId;
+
+      // Broadcast to specific customer
+      broadcastToCustomerSupport(recipientId, {
+        type: 'new_support_message',
+        message: {
+          ...adminMessage,
+          _id: adminMessage._id.toString(),
+          userId: adminMessage.userId.toString(),
+          fromUserId: adminMessage.fromUserId.toString(),
+          toUserId: adminMessage.toUserId.toString()
+        }
+      });
+
+      console.log('✅ Admin message sent to customer:', recipientId);
+
+      res.json({
+        ...adminMessage,
+        _id: adminMessage._id.toString(),
+        userId: adminMessage.userId.toString(),
+        fromUserId: adminMessage.fromUserId.toString(),
+        toUserId: adminMessage.toUserId.toString()
+      });
+    }
+  } catch (error) {
+    handleError(res, error, 'Failed to send message');
+  }
+});
+
+// Get support messages for current user (customer view)
+app.get('/api/support/messages', authenticateToken, async (req, res) => {
+  try {
+    if (req.user.role === 'admin') {
+      return res.status(403).json({ error: 'Use /api/support/conversations for admin' });
+    }
+
+    const messages = await db.collection('support_messages')
+      .find({ userId: req.user._id })
+      .sort({ createdAt: 1 })
+      .toArray();
+
+    res.json(messages.map(msg => ({
+      ...msg,
+      _id: msg._id.toString(),
+      userId: msg.userId.toString(),
+      fromUserId: msg.fromUserId ? msg.fromUserId.toString() : null,
+      toUserId: msg.toUserId ? msg.toUserId.toString() : null
+    })));
+  } catch (error) {
+    handleError(res, error, 'Failed to fetch messages');
+  }
+});
+
+// Get all support conversations (admin view)
+app.get('/api/support/conversations', authenticateAdmin, async (req, res) => {
+  try {
+    // Get all unique users who have sent support messages
+    const conversations = await db.collection('support_messages').aggregate([
+      {
+        $group: {
+          _id: '$userId',
+          lastMessage: { $last: '$message' },
+          lastMessageTime: { $last: '$createdAt' },
+          messageCount: { $sum: 1 }
+        }
+      },
+      {
+        $lookup: {
+          from: 'users',
+          localField: '_id',
+          foreignField: '_id',
+          as: 'user'
+        }
+      },
+      { $unwind: '$user' },
+      {
+        $project: {
+          userId: '$_id',
+          userName: { $concat: ['$user.firstName', ' ', '$user.lastName'] },
+          userEmail: '$user.email',
+          lastMessage: 1,
+          lastMessageTime: 1,
+          messageCount: 1
+        }
+      },
+      { $sort: { lastMessageTime: -1 } }
+    ]).toArray();
+
+    res.json(conversations.map(conv => ({
+      ...conv,
+      userId: conv.userId.toString()
+    })));
+  } catch (error) {
+    handleError(res, error, 'Failed to fetch conversations');
+  }
+});
+
+// Get messages for specific user (admin view)
+app.get('/api/support/conversation/:userId', authenticateAdmin, [
+  param('userId').isMongoId()
+], validate, async (req, res) => {
+  try {
+    const userId = new ObjectId(req.params.userId);
+
+    const messages = await db.collection('support_messages')
+      .find({ userId })
+      .sort({ createdAt: 1 })
+      .toArray();
+
+    res.json(messages.map(msg => ({
+      ...msg,
+      _id: msg._id.toString(),
+      userId: msg.userId.toString(),
+      fromUserId: msg.fromUserId ? msg.fromUserId.toString() : null,
+      toUserId: msg.toUserId ? msg.toUserId.toString() : null
+    })));
+  } catch (error) {
+    handleError(res, error, 'Failed to fetch conversation');
   }
 });
 
@@ -664,7 +1033,7 @@ app.post('/api/orders', authenticateToken, [
     const result = await db.collection('orders').insertOne(order);
     order._id = result.insertedId;
 
-    // Clear cart after order
+    // Clear cart after ordercreateIndexes
     await db.collection('carts').updateOne(
       { userId: req.user._id },
       { $set: { items: [], updatedAt: new Date() } },
@@ -700,65 +1069,65 @@ app.post('/api/orders', authenticateToken, [
 
 // ==================== ORDER ENDPOINTS ====================
 
-app.post('/api/orders', authenticateToken, [
-  body('items').isArray({ min: 1 }),
-  body('totalAmount').isFloat({ min: 0 })
-], validate, async (req, res) => {
-  try {
-    const { items, totalAmount, shippingAddress, specialInstructions } = req.body;
+// app.post('/api/orders', authenticateToken, [
+//   body('items').isArray({ min: 1 }),
+//   body('totalAmount').isFloat({ min: 0 })
+// ], validate, async (req, res) => {
+//   try {
+//     const { items, totalAmount, shippingAddress, specialInstructions } = req.body;
 
-    const calculated = items.reduce((sum, i) => sum + (i.price * i.quantity), 0);
-    if (Math.abs(calculated - totalAmount) > 0.01) {
-      return res.status(400).json({ error: 'Total mismatch' });
-    }
+//     const calculated = items.reduce((sum, i) => sum + (i.price * i.quantity), 0);
+//     if (Math.abs(calculated - totalAmount) > 0.01) {
+//       return res.status(400).json({ error: 'Total mismatch' });
+//     }
 
-    const order = {
-      userId: req.user._id,
-      orderNumber: generateOrderNumber(),
-      status: 'pending',
-      paymentStatus: 'pending',
-      items,
-      totalAmount,
-      shippingAddress: shippingAddress || null,
-      specialInstructions: specialInstructions || '',
-      createdAt: new Date(),
-      updatedAt: new Date()
-    };
+//     const order = {
+//       userId: req.user._id,
+//       orderNumber: generateOrderNumber(),
+//       status: 'pending',
+//       paymentStatus: 'pending',
+//       items,
+//       totalAmount,
+//       shippingAddress: shippingAddress || null,
+//       specialInstructions: specialInstructions || '',
+//       createdAt: new Date(),
+//       updatedAt: new Date()
+//     };
 
-    const result = await db.collection('orders').insertOne(order);
-    order._id = result.insertedId;
+//     const result = await db.collection('orders').insertOne(order);
+//     order._id = result.insertedId;
 
-    // Clear cart after order
-    await db.collection('carts').updateOne(
-      { userId: req.user._id },
-      { $set: { items: [], updatedAt: new Date() } },
-      { upsert: true }
-    );
+//     // Clear cart after order
+//     await db.collection('carts').updateOne(
+//       { userId: req.user._id },
+//       { $set: { items: [], updatedAt: new Date() } },
+//       { upsert: true }
+//     );
 
-    sendOrderConfirmationEmail(order).catch(e =>
-      console.error('Email error:', e)
-    );
-    // ✅ BROADCAST TO ALL ADMINS - NEW ORDER
-    broadcastToAdmins({
-      type: 'new_order',
-      order: {
-        ...order,
-        _id: order._id.toString(),
-        userId: order.userId.toString(),
-        user: [{
-          firstName: req.user.firstName,
-          lastName: req.user.lastName,
-          email: req.user.email
-        }]
-      }
-    });
+//     sendOrderConfirmationEmail(order).catch(e =>
+//       console.error('Email error:', e)
+//     );
+//     // ✅ BROADCAST TO ALL ADMINS - NEW ORDER
+//     broadcastToAdmins({
+//       type: 'new_order',
+//       order: {
+//         ...order,
+//         _id: order._id.toString(),
+//         userId: order.userId.toString(),
+//         user: [{
+//           firstName: req.user.firstName,
+//           lastName: req.user.lastName,
+//           email: req.user.email
+//         }]
+//       }
+//     });
 
-    console.log('✅ Order created:', order.orderNumber);
-    res.json(order);
-  } catch (error) {
-    handleError(res, error, 'Order creation failed');
-  }
-});
+//     console.log('✅ Order created:', order.orderNumber);
+//     res.json(order);
+//   } catch (error) {
+//     handleError(res, error, 'Order creation failed');
+//   }
+// });
 
 // ==================== ORDER STATUS UPDATE ENDPOINT ====================
 
@@ -928,34 +1297,7 @@ const sseClients = {
 };
 
 // Special SSE authentication that accepts token from query or header
-const authenticateSSE = async (req, res, next) => {
-  try {
-    let token = req.query.token;
 
-    if (!token) {
-      const authHeader = req.headers.authorization;
-      if (authHeader?.startsWith('Bearer ')) {
-        token = authHeader.split(' ')[1];
-      }
-    }
-
-    if (!token) {
-      return res.status(401).json({ error: 'No token provided' });
-    }
-
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    const user = await db.collection('users').findOne(
-      { _id: new ObjectId(decoded.userId) },
-      { projection: { password: 0 } }
-    );
-
-    if (!user) return res.status(401).json({ error: 'User not found' });
-    req.user = user;
-    next();
-  } catch (error) {
-    res.status(401).json({ error: 'Invalid token' });
-  }
-};
 
 // SSE endpoint for admins
 app.get('/api/sse/admin', authenticateSSE, (req, res) => {
@@ -1009,37 +1351,37 @@ app.get('/api/sse/customer', authenticateSSE, (req, res) => {
 });
 
 // SSE endpoint for customers (get notified of order status changes)
-app.get('/api/sse/customer', authenticateToken, (req, res) => {
-  const userId = req.user._id.toString();
+// app.get('/api/sse/customer', authenticateToken, (req, res) => {
+//   const userId = req.user._id.toString();
 
-  // Set SSE headers
-  res.setHeader('Content-Type', 'text/event-stream');
-  res.setHeader('Cache-Control', 'no-cache');
-  res.setHeader('Connection', 'keep-alive');
-  res.setHeader('X-Accel-Buffering', 'no');
+//   // Set SSE headers
+//   res.setHeader('Content-Type', 'text/event-stream');
+//   res.setHeader('Cache-Control', 'no-cache');
+//   res.setHeader('Connection', 'keep-alive');
+//   res.setHeader('X-Accel-Buffering', 'no');
 
-  // Send initial connection message
-  res.write('data: {"type":"connected","message":"Customer SSE connected"}\n\n');
+//   // Send initial connection message
+//   res.write('data: {"type":"connected","message":"Customer SSE connected"}\n\n');
 
-  // Add this client to customer clients
-  if (!sseClients.customers.has(userId)) {
-    sseClients.customers.set(userId, new Set());
-  }
-  sseClients.customers.get(userId).add(res);
-  console.log('✅ Customer SSE connected:', req.user.email);
+//   // Add this client to customer clients
+//   if (!sseClients.customers.has(userId)) {
+//     sseClients.customers.set(userId, new Set());
+//   }
+//   sseClients.customers.get(userId).add(res);
+//   console.log('✅ Customer SSE connected:', req.user.email);
 
-  // Cleanup on disconnect
-  req.on('close', () => {
-    const userClients = sseClients.customers.get(userId);
-    if (userClients) {
-      userClients.delete(res);
-      if (userClients.size === 0) {
-        sseClients.customers.delete(userId);
-      }
-    }
-    console.log('❌ Customer SSE disconnected:', req.user.email);
-  });
-});
+//   // Cleanup on disconnect
+//   req.on('close', () => {
+//     const userClients = sseClients.customers.get(userId);
+//     if (userClients) {
+//       userClients.delete(res);
+//       if (userClients.size === 0) {
+//         sseClients.customers.delete(userId);
+//       }
+//     }
+//     console.log('❌ Customer SSE disconnected:', req.user.email);
+//   });
+// });
 
 // Helper function to broadcast to all admin clients
 function broadcastToAdmins(data) {
