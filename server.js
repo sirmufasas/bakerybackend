@@ -1082,8 +1082,10 @@ app.post('/api/orders', authenticateToken, [
       items,
       totalAmount,
       phone: customerPhone,
-      address: deliveryMethod === 'delivery' ? customerAddress : '',  // ✅ UPDATED
-      deliveryMethod,  // ✅ ADDED
+      address: deliveryMethod === 'delivery' ? customerAddress : '',
+      deliveryMethod,
+      deliveryFee: req.body.deliveryFee || 0,  // ✅ ADD THIS
+      deliveryZone: req.body.deliveryZone || '',  // ✅ ADD THIS
       shippingAddress: shippingAddress || customerAddress,
       specialInstructions: specialInstructions || '',
       createdAt: new Date(),
