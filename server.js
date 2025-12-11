@@ -1069,9 +1069,28 @@ app.post('/api/orders', authenticateToken, [
       deliveryMethod  // ✅ ADDED
     } = req.body;
 
-    const calculated = items.reduce((sum, i) => sum + (i.price * i.quantity), 0);
-    if (Math.abs(calculated - totalAmount) > 0.01) {
-      return res.status(400).json({ error: 'Total mismatch' });
+    const itemsSubtotal = items.reduce((sum, i) => sum + (i.price * i.quantity), 0);
+    const deliveryFee = req.body.deliveryFee || 0;
+    const expectedTotal = itemsSubtotal + deliveryFee;
+
+    // Allow small rounding differences
+    if (Math.abs(expectedTotal - totalAmount) > 0.01) {
+      console.error('❌ Total mismatch:', {
+        itemsSubtotal,
+        deliveryFee,
+        expectedTotal,
+        receivedTotal: totalAmount,
+        difference: Math.abs(expectedTotal - totalAmount)
+      });
+      return res.status(400).json({
+        error: 'Total mismatch',
+        details: {
+          expected: expectedTotal,
+          received: totalAmount,
+          itemsSubtotal,
+          deliveryFee
+        }
+      });
     }
 
     const order = {
