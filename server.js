@@ -230,7 +230,7 @@ const initDatabase = async () => {
   }
 };
 
-// Email functions
+// Update sendOrderConfirmationEmail function (around line 295)
 async function sendOrderConfirmationEmail(order) {
   try {
     const user = await db.collection('users').findOne({ _id: order.userId });
@@ -243,6 +243,20 @@ async function sendOrderConfirmationEmail(order) {
       `• ${i.name} x${i.quantity} - R${(i.price * i.quantity).toFixed(2)}`
     ).join('<br>');
 
+    // ✅ DELIVERY METHOD DISPLAY
+    const deliveryInfo = order.deliveryMethod === 'delivery'
+      ? `<p><strong>Delivery Method:</strong> 🚚 Home Delivery</p>
+         ${order.address ? `<p><strong>Delivery Address:</strong><br>${order.address}</p>` : ''}`
+      : `<p><strong>Delivery Method:</strong> 🏪 Store Pickup</p>
+         <div style="background:#E0F2FE;padding:15px;border-radius:8px;border-left:4px solid #0284C7;margin-top:10px">
+           <p style="margin:0;font-size:14px;color:#075985">
+             <strong>📍 Pickup Location:</strong><br>
+             Portugal Bakery<br>
+             123 Main Street, Johannesburg<br>
+             Mon-Sat: 7:00 AM - 6:00 PM | Sun: 8:00 AM - 2:00 PM
+           </p>
+         </div>`;
+
     await resend.emails.send({
       from: 'Portugal Bakery <onboarding@resend.dev>',
       to: user.email,
@@ -252,6 +266,11 @@ async function sendOrderConfirmationEmail(order) {
         <p>Dear ${user.firstName}, thank you for your order!</p>
         <div style="background:#FFF8DC;padding:20px;border-radius:10px;margin:20px 0">
           <p><strong>Order Number:</strong> ${order.orderNumber}</p>
+          
+          ${deliveryInfo}
+          
+          ${order.phone ? `<p style="margin-top:10px"><strong>Phone:</strong> ${order.phone}</p>` : ''}
+          
           <p style="margin-top:15px"><strong>Items:</strong></p>
           <p>${items}</p>
           <p style="font-size:18px;margin-top:15px;color:#8B4513">
@@ -267,7 +286,9 @@ async function sendOrderConfirmationEmail(order) {
           </div>
         ` : ''}
         <p style="font-size:14px;color:#666;margin-top:20px">
-          We'll send you updates as your order progresses.
+          ${order.deliveryMethod === 'pickup'
+          ? "We'll notify you when your order is ready for pickup."
+          : "We'll send you updates as your order is being prepared and delivered."}
         </p>
         <p>Best regards,<br>Portugal Bakery Team</p>
       </div>`
@@ -287,10 +308,13 @@ async function sendOrderStatusEmail(order) {
       return;
     }
 
+    // ✅ DIFFERENT MESSAGES FOR DELIVERY VS PICKUP
     const statusMessages = {
       pending: {
         title: 'Order Received 📝',
-        message: 'We have received your order and will start preparing it soon.',
+        message: order.deliveryMethod === 'pickup'
+          ? 'We have received your order and will start preparing it for pickup.'
+          : 'We have received your order and will start preparing it for delivery.',
         color: '#F59E0B'
       },
       processing: {
@@ -299,13 +323,17 @@ async function sendOrderStatusEmail(order) {
         color: '#F97316'
       },
       shipped: {
-        title: 'Order on the Way 🚗',
-        message: 'Your order is on its way to you. Get ready to enjoy!',
+        title: order.deliveryMethod === 'pickup' ? 'Order Ready for Pickup 🎉' : 'Order on the Way 🚗',
+        message: order.deliveryMethod === 'pickup'
+          ? 'Your order is ready! Come pick it up at our store during business hours.'
+          : 'Your order is on its way to you. Get ready to enjoy!',
         color: '#3B82F6'
       },
       delivered: {
-        title: 'Order Delivered ✅',
-        message: 'Your order has been delivered. Enjoy your treats!',
+        title: order.deliveryMethod === 'pickup' ? 'Order Collected ✅' : 'Order Delivered ✅',
+        message: order.deliveryMethod === 'pickup'
+          ? 'Thank you for picking up your order. Enjoy your treats!'
+          : 'Your order has been delivered. Enjoy your treats!',
         color: '#10B981'
       },
       cancelled: {
@@ -327,8 +355,20 @@ async function sendOrderStatusEmail(order) {
         <p>Your order status has been updated:</p>
         <div style="background:#FFF8DC;padding:20px;border-radius:10px;margin:20px 0;border-left:4px solid ${statusInfo.color}">
           <p><strong>Order Number:</strong> ${order.orderNumber}</p>
+          <p><strong>Delivery Method:</strong> ${order.deliveryMethod === 'pickup' ? '🏪 Store Pickup' : '🚚 Home Delivery'}</p>
           <p><strong>Status:</strong> <span style="color:${statusInfo.color};font-weight:bold">${order.status.toUpperCase()}</span></p>
           <p style="margin-top:15px;font-size:16px">${statusInfo.message}</p>
+          
+          ${order.deliveryMethod === 'pickup' && order.status === 'shipped' ? `
+            <div style="background:#E0F2FE;padding:15px;border-radius:8px;margin-top:15px">
+              <p style="margin:0;font-size:14px;color:#075985">
+                <strong>📍 Pickup Location:</strong><br>
+                Portugal Bakery<br>
+                123 Main Street, Johannesburg<br>
+                Mon-Sat: 7:00 AM - 6:00 PM | Sun: 8:00 AM - 2:00 PM
+              </p>
+            </div>
+          ` : ''}
         </div>
         <p style="font-size:14px;color:#666">
           If you have any questions, feel free to reach out to us.
@@ -1007,10 +1047,27 @@ app.delete('/api/cart', authenticateToken, async (req, res) => {
 
 app.post('/api/orders', authenticateToken, [
   body('items').isArray({ min: 1 }),
-  body('totalAmount').isFloat({ min: 0 })
+  body('totalAmount').isFloat({ min: 0 }),
+  body('customerPhone').trim().notEmpty(),
+  body('deliveryMethod').isIn(['delivery', 'pickup']), // ✅ ADDED
+  // Only require address if delivery method is 'delivery'
+  body('customerAddress').custom((value, { req }) => {
+    if (req.body.deliveryMethod === 'delivery' && !value?.trim()) {
+      throw new Error('Delivery address is required for delivery orders');
+    }
+    return true;
+  })
 ], validate, async (req, res) => {
   try {
-    const { items, totalAmount, shippingAddress, specialInstructions } = req.body;
+    const {
+      items,
+      totalAmount,
+      shippingAddress,
+      specialInstructions,
+      customerPhone,
+      customerAddress,
+      deliveryMethod  // ✅ ADDED
+    } = req.body;
 
     const calculated = items.reduce((sum, i) => sum + (i.price * i.quantity), 0);
     if (Math.abs(calculated - totalAmount) > 0.01) {
@@ -1024,7 +1081,10 @@ app.post('/api/orders', authenticateToken, [
       paymentStatus: 'pending',
       items,
       totalAmount,
-      shippingAddress: shippingAddress || null,
+      phone: customerPhone,
+      address: deliveryMethod === 'delivery' ? customerAddress : '',  // ✅ UPDATED
+      deliveryMethod,  // ✅ ADDED
+      shippingAddress: shippingAddress || customerAddress,
       specialInstructions: specialInstructions || '',
       createdAt: new Date(),
       updatedAt: new Date()
@@ -1033,7 +1093,7 @@ app.post('/api/orders', authenticateToken, [
     const result = await db.collection('orders').insertOne(order);
     order._id = result.insertedId;
 
-    // Clear cart after ordercreateIndexes
+    // Clear cart after order
     await db.collection('carts').updateOne(
       { userId: req.user._id },
       { $set: { items: [], updatedAt: new Date() } },
@@ -1045,7 +1105,7 @@ app.post('/api/orders', authenticateToken, [
       console.error('Email error:', e)
     );
 
-    // ✅ BROADCAST TO ALL ADMINS - NEW ORDER
+    // Broadcast to all admins
     broadcastToAdmins({
       type: 'new_order',
       order: {
@@ -1060,74 +1120,12 @@ app.post('/api/orders', authenticateToken, [
       }
     });
 
-    console.log('✅ Order created:', order.orderNumber);
+    console.log('✅ Order created:', order.orderNumber, '- Method:', deliveryMethod);
     res.json(order);
   } catch (error) {
     handleError(res, error, 'Order creation failed');
   }
 });
-
-// ==================== ORDER ENDPOINTS ====================
-
-// app.post('/api/orders', authenticateToken, [
-//   body('items').isArray({ min: 1 }),
-//   body('totalAmount').isFloat({ min: 0 })
-// ], validate, async (req, res) => {
-//   try {
-//     const { items, totalAmount, shippingAddress, specialInstructions } = req.body;
-
-//     const calculated = items.reduce((sum, i) => sum + (i.price * i.quantity), 0);
-//     if (Math.abs(calculated - totalAmount) > 0.01) {
-//       return res.status(400).json({ error: 'Total mismatch' });
-//     }
-
-//     const order = {
-//       userId: req.user._id,
-//       orderNumber: generateOrderNumber(),
-//       status: 'pending',
-//       paymentStatus: 'pending',
-//       items,
-//       totalAmount,
-//       shippingAddress: shippingAddress || null,
-//       specialInstructions: specialInstructions || '',
-//       createdAt: new Date(),
-//       updatedAt: new Date()
-//     };
-
-//     const result = await db.collection('orders').insertOne(order);
-//     order._id = result.insertedId;
-
-//     // Clear cart after order
-//     await db.collection('carts').updateOne(
-//       { userId: req.user._id },
-//       { $set: { items: [], updatedAt: new Date() } },
-//       { upsert: true }
-//     );
-
-//     sendOrderConfirmationEmail(order).catch(e =>
-//       console.error('Email error:', e)
-//     );
-//     // ✅ BROADCAST TO ALL ADMINS - NEW ORDER
-//     broadcastToAdmins({
-//       type: 'new_order',
-//       order: {
-//         ...order,
-//         _id: order._id.toString(),
-//         userId: order.userId.toString(),
-//         user: [{
-//           firstName: req.user.firstName,
-//           lastName: req.user.lastName,
-//           email: req.user.email
-//         }]
-//       }
-//     });
-
-//     console.log('✅ Order created:', order.orderNumber);
-//     res.json(order);
-//   } catch (error) {
-//     handleError(res, error, 'Order creation failed');
-//   }
-// });
 
 // ==================== ORDER STATUS UPDATE ENDPOINT ====================
 
