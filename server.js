@@ -81,10 +81,13 @@ app.use(helmet());
 app.use(
   cors({
     origin: [
-      process.env.FRONTEND_URL,      // Netlify
-      "http://localhost:8080",       // Local dev
-      "http://localhost:5173",       // Vite dev
-      "http://localhost:3000"        // Local fallback
+      process.env.FRONTEND_URL,     // Netlify live site
+      "https://portubakery.netlify.app", // (just in case)
+      "capacitor://localhost",       // Android Capacitor app
+      "http://localhost",           // Android WebView fallback
+      "http://localhost:8080",      // local dev
+      "http://localhost:5173",      // local dev
+      "http://localhost:3000"       // local fallback
     ],
     credentials: true,
   })
