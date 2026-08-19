@@ -10,6 +10,7 @@ const bcrypt = require('bcrypt');
 const rateLimit = require('express-rate-limit');
 const helmet = require('helmet');
 const { body, param, query, validationResult } = require('express-validator');
+const deliveryEngine = require('./delivery/engine');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -92,7 +93,13 @@ app.use(
     credentials: true,
   })
 );
-app.use(express.json({ limit: '10mb' }));
+app.use(express.json({
+  limit: '10mb',
+  // Stash the raw bytes so webhook signature verification (e.g. Uber
+  // Direct's x-uber-signature) can HMAC the exact bytes that were sent,
+  // not a re-serialized version of the parsed JSON.
+  verify: (req, res, buf) => { req.rawBody = buf; }
+}));
 
 const apiLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 100 });
 const strictLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 10 });
@@ -1112,6 +1119,24 @@ app.post('/api/orders', authenticateToken, [
       deliveryZone: req.body.deliveryZone || '',  // ✅ ADD THIS
       shippingAddress: shippingAddress || customerAddress,
       specialInstructions: specialInstructions || '',
+
+      // Delivery engine fields - populated at checkout (provider selection)
+      // and later by staff (courier request/tracking). All null/empty for
+      // pickup orders and for orders that haven't been dispatched yet.
+      deliveryProvider: deliveryMethod === 'delivery' ? (req.body.deliveryProvider || 'own_delivery') : null,
+      deliveryService: deliveryMethod === 'delivery' ? (req.body.deliveryService || null) : null,
+      deliveryQuoteId: req.body.deliveryQuoteId || null,
+      providerDeliveryId: null,
+      trackingUrl: null,
+      driverDetails: null,
+      pickupLocation: req.body.pickupLocation || null, // for PUDO-style pickup-point orders
+      estimatedDelivery: null,
+      courierRequestedAt: null,
+      driverAssignedAt: null,
+      pickedUpAt: null,
+      deliveredAt: null,
+      deliveryFailureReason: null,
+
       createdAt: new Date(),
       updatedAt: new Date()
     };
@@ -1159,7 +1184,14 @@ app.put('/api/orders/:orderNumber/status',
   authenticateAdmin,
   [
     param('orderNumber').matches(/^PB-[A-Z0-9]{8}-[A-Z0-9]{4}$/),
-    body('status').isIn(['pending', 'processing', 'shipped', 'delivered', 'cancelled'])
+    body('status').isIn([
+      // Original statuses - kept for backward compatibility with existing orders/UI.
+      'pending', 'processing', 'shipped', 'delivered', 'cancelled',
+      // Delivery lifecycle statuses.
+      'confirmed', 'preparing', 'ready_for_pickup', 'ready_for_delivery',
+      'courier_requested', 'driver_assigned', 'driver_arriving',
+      'out_for_delivery', 'completed', 'delivery_failed', 'payment_failed'
+    ])
   ],
   (req, res, next) => {
     const errors = validationResult(req);
@@ -1314,6 +1346,310 @@ app.put('/api/orders/:orderNumber/status',
     }
   }
 );
+
+// ==================== DELIVERY ENGINE ====================
+
+// List all providers and whether each is currently configured. No secrets
+// are ever included - just ids/names/capabilities/configured flag.
+app.get('/api/delivery/providers', authenticateToken, async (req, res) => {
+  try {
+    const settings = await deliveryEngine.getDeliverySettings(db);
+    const providers = deliveryEngine.listAllProviders().map(p => ({
+      ...p,
+      enabled: (settings.enabledProviders || []).includes(p.id)
+    }));
+    res.json({ providers });
+  } catch (error) {
+    handleError(res, error, 'Failed to load delivery providers');
+  }
+});
+
+// Get live delivery quotes for a candidate address/cart, compared across
+// every enabled + configured + eligible provider. Never called with an
+// order yet - this is purely for checkout-time comparison.
+app.post('/api/delivery/quotes', authenticateToken, [
+  body('address').trim().notEmpty(),
+  body('items').optional().isArray(),
+  body('subtotal').optional().isFloat({ min: 0 })
+], validate, async (req, res) => {
+  try {
+    const { address, city, zipCode, latitude, longitude, items, subtotal } = req.body;
+    const quotes = await deliveryEngine.getQuotes({
+      db, address, city, zipCode, latitude, longitude,
+      items: items || [],
+      subtotal: subtotal || 0
+    });
+    res.json({ quotes });
+  } catch (error) {
+    handleError(res, error, 'Failed to get delivery quotes');
+  }
+});
+
+// Admin: view/update which providers are enabled + delivery business rules.
+app.get('/api/admin/delivery-settings', authenticateAdmin, async (req, res) => {
+  try {
+    const settings = await deliveryEngine.getDeliverySettings(db);
+    res.json(settings);
+  } catch (error) {
+    handleError(res, error, 'Failed to load delivery settings');
+  }
+});
+
+app.put('/api/admin/delivery-settings', authenticateAdmin, [
+  body('enabledProviders').optional().isArray(),
+  body('freeDeliveryThreshold').optional({ nullable: true }).isFloat({ min: 0 }),
+  body('minimumOrderForDelivery').optional({ nullable: true }).isFloat({ min: 0 })
+], validate, async (req, res) => {
+  try {
+    const update = {};
+    if (req.body.enabledProviders) update.enabledProviders = req.body.enabledProviders;
+    if ('freeDeliveryThreshold' in req.body) update.freeDeliveryThreshold = req.body.freeDeliveryThreshold;
+    if ('minimumOrderForDelivery' in req.body) update.minimumOrderForDelivery = req.body.minimumOrderForDelivery;
+
+    await db.collection('delivery_settings').updateOne(
+      { _id: 'default' },
+      { $set: update },
+      { upsert: true }
+    );
+    const settings = await deliveryEngine.getDeliverySettings(db);
+    res.json(settings);
+  } catch (error) {
+    handleError(res, error, 'Failed to update delivery settings');
+  }
+});
+
+// Staff mark an order as packed and ready to be handed to a courier. This
+// is a DELIBERATE separate step from "request courier" - per the delivery
+// principle, no courier request may happen before this.
+app.put('/api/orders/:orderNumber/ready-for-delivery', authenticateAdmin, [
+  param('orderNumber').matches(/^PB-[A-Z0-9]{8}-[A-Z0-9]{4}$/)
+], validate, async (req, res) => {
+  try {
+    const { orderNumber } = req.params;
+    const order = await db.collection('orders').findOne({ orderNumber });
+    if (!order) return res.status(404).json({ error: 'Order not found' });
+    if (order.deliveryMethod !== 'delivery') {
+      return res.status(400).json({ error: 'Only delivery orders can be marked ready for delivery' });
+    }
+    if (order.paymentStatus !== 'paid' && order.status !== 'paid') {
+      // paymentStatus is the authoritative field; keep this permissive
+      // enough not to block on naming drift elsewhere in the codebase.
+    }
+
+    const result = await db.collection('orders').findOneAndUpdate(
+      { orderNumber, status: { $in: ['pending', 'processing', 'confirmed', 'preparing'] } },
+      { $set: { status: 'ready_for_delivery', updatedAt: new Date() } },
+      { returnDocument: 'after' }
+    );
+
+    if (!result || !result.value && !result._id) {
+      return res.status(409).json({ error: 'Order is not in a state that can be marked ready for delivery', currentStatus: order.status });
+    }
+    const updated = result.value || result;
+
+    broadcastToAdmins({ type: 'order_status_changed', order: { orderNumber, status: 'ready_for_delivery' } });
+    broadcastToCustomer(order.userId, { type: 'order_status_changed', order: { orderNumber, status: 'ready_for_delivery', updatedAt: updated.updatedAt } });
+
+    res.json({ ...updated, _id: updated._id.toString(), userId: updated.userId.toString() });
+  } catch (error) {
+    handleError(res, error, 'Failed to mark order ready for delivery');
+  }
+});
+
+// Staff request the selected (or overridden) courier provider. This is the
+// ONLY place a courier request is actually made, and only once the order is
+// ready_for_delivery. Duplicate-request protection is enforced atomically
+// at the DB level via the filter below (courierRequestedAt must not already
+// be set), not just by disabling a button in the UI.
+app.post('/api/orders/:orderNumber/request-courier', authenticateAdmin, [
+  param('orderNumber').matches(/^PB-[A-Z0-9]{8}-[A-Z0-9]{4}$/),
+  body('providerId').optional().isString()
+], validate, async (req, res) => {
+  const { orderNumber } = req.params;
+  try {
+    const order = await db.collection('orders').findOne({ orderNumber });
+    if (!order) return res.status(404).json({ error: 'Order not found' });
+    if (order.paymentStatus !== 'paid') {
+      return res.status(400).json({ error: 'Cannot request courier - order is not paid' });
+    }
+    if (!order.address) {
+      return res.status(400).json({ error: 'Cannot request courier - order has no delivery address' });
+    }
+    if (order.status !== 'ready_for_delivery') {
+      return res.status(400).json({ error: 'Order must be marked ready for delivery before a courier can be requested', currentStatus: order.status });
+    }
+    if (order.providerDeliveryId || order.courierRequestedAt) {
+      return res.status(409).json({ error: 'A courier has already been requested for this order', providerDeliveryId: order.providerDeliveryId });
+    }
+
+    const providerId = req.body.providerId || order.deliveryProvider || 'own_delivery';
+    const provider = deliveryEngine.getProvider(providerId);
+    if (!provider.isConfigured()) {
+      return res.status(400).json({ error: `${provider.name} is not configured - missing credentials.` });
+    }
+
+    // Atomically claim this order for dispatch BEFORE calling the external
+    // API, so a double-click / race can never result in two courier
+    // requests. If this update matches nothing, someone else already
+    // claimed it.
+    const claim = await db.collection('orders').findOneAndUpdate(
+      { orderNumber, providerDeliveryId: null, courierRequestedAt: null },
+      { $set: { courierRequestedAt: new Date(), deliveryProvider: providerId, updatedAt: new Date() } },
+      { returnDocument: 'after' }
+    );
+    const claimedOrder = claim.value || claim;
+    if (!claimedOrder) {
+      return res.status(409).json({ error: 'A courier has already been requested for this order (race detected)' });
+    }
+
+    let deliveryResult;
+    try {
+      deliveryResult = await deliveryEngine.requestCourier(providerId, claimedOrder);
+    } catch (providerError) {
+      // Roll back the claim so staff can retry or switch provider.
+      await db.collection('orders').updateOne(
+        { orderNumber },
+        { $set: { courierRequestedAt: null, deliveryFailureReason: providerError.message, updatedAt: new Date() } }
+      );
+      console.error('Courier request failed:', providerError.message);
+      return res.status(502).json({ error: `Failed to request ${provider.name}: ${providerError.message}` });
+    }
+
+    const finalUpdate = await db.collection('orders').findOneAndUpdate(
+      { orderNumber },
+      {
+        $set: {
+          status: deliveryResult.status || 'courier_requested',
+          providerDeliveryId: deliveryResult.providerDeliveryId,
+          trackingUrl: deliveryResult.trackingUrl,
+          updatedAt: new Date()
+        }
+      },
+      { returnDocument: 'after' }
+    );
+    const updated = finalUpdate.value || finalUpdate;
+
+    broadcastToAdmins({ type: 'order_status_changed', order: { orderNumber, status: updated.status } });
+    broadcastToCustomer(order.userId, { type: 'order_status_changed', order: { orderNumber, status: updated.status, trackingUrl: updated.trackingUrl, updatedAt: updated.updatedAt } });
+
+    res.json({ ...updated, _id: updated._id.toString(), userId: updated.userId.toString() });
+  } catch (error) {
+    handleError(res, error, 'Failed to request courier');
+  }
+});
+
+// Staff switch to a different provider if the originally selected one can't
+// fulfil the delivery (before a driver has actually been assigned).
+app.post('/api/orders/:orderNumber/switch-provider', authenticateAdmin, [
+  param('orderNumber').matches(/^PB-[A-Z0-9]{8}-[A-Z0-9]{4}$/),
+  body('providerId').isString().notEmpty()
+], validate, async (req, res) => {
+  try {
+    const { orderNumber } = req.params;
+    const { providerId } = req.body;
+    const order = await db.collection('orders').findOne({ orderNumber });
+    if (!order) return res.status(404).json({ error: 'Order not found' });
+    if (order.driverAssignedAt) {
+      return res.status(400).json({ error: 'Cannot switch provider after a driver has already been assigned' });
+    }
+
+    const provider = deliveryEngine.getProvider(providerId);
+    if (!provider.isConfigured()) {
+      return res.status(400).json({ error: `${provider.name} is not configured - missing credentials.` });
+    }
+
+    // If a request had already gone out to the old provider, cancel it first.
+    if (order.providerDeliveryId && order.deliveryProvider) {
+      try {
+        await deliveryEngine.cancelCourier(order.deliveryProvider, order.providerDeliveryId);
+      } catch (e) {
+        console.error('Failed to cancel previous courier request during switch:', e.message);
+      }
+    }
+
+    await db.collection('orders').updateOne(
+      { orderNumber },
+      {
+        $set: {
+          deliveryProvider: providerId,
+          status: 'ready_for_delivery',
+          providerDeliveryId: null,
+          trackingUrl: null,
+          courierRequestedAt: null,
+          driverAssignedAt: null,
+          deliveryFailureReason: null,
+          updatedAt: new Date()
+        }
+      }
+    );
+
+    const updated = await db.collection('orders').findOne({ orderNumber });
+    broadcastToAdmins({ type: 'order_status_changed', order: { orderNumber, status: updated.status, deliveryProvider: providerId } });
+    res.json({ ...updated, _id: updated._id.toString(), userId: updated.userId.toString() });
+  } catch (error) {
+    handleError(res, error, 'Failed to switch delivery provider');
+  }
+});
+
+// Uber Direct webhook - signature-verified, never trusts an unverified request.
+app.post('/api/webhooks/uber-direct', async (req, res) => {
+  try {
+    const uberDirect = deliveryEngine.getProvider('uber_direct');
+    const signature = req.headers['x-uber-signature'];
+    const rawBody = req.rawBody ? req.rawBody.toString('utf8') : JSON.stringify(req.body);
+
+    if (!uberDirect.verifyWebhook(rawBody, signature)) {
+      console.warn('⚠️ Rejected Uber Direct webhook - invalid signature');
+      return res.status(401).json({ error: 'Invalid signature' });
+    }
+
+    const event = uberDirect.parseWebhookEvent(req.body);
+    if (!event.providerDeliveryId) {
+      return res.status(200).json({ received: true }); // ack, nothing to do
+    }
+
+    const order = await db.collection('orders').findOne({ providerDeliveryId: event.providerDeliveryId });
+    if (!order) {
+      return res.status(200).json({ received: true }); // ack - not one of our orders (or already cleaned up)
+    }
+
+    // Map Uber's delivery status to our internal lifecycle. Only map
+    // statuses Uber actually documents - unrecognized ones are logged, not
+    // guessed at.
+    const statusMap = {
+      pending: 'courier_requested',
+      pickup: 'driver_assigned',
+      pickup_complete: 'out_for_delivery',
+      dropoff: 'out_for_delivery',
+      delivered: 'delivered',
+      canceled: 'delivery_failed'
+    };
+    const mappedStatus = statusMap[event.status];
+
+    const update = { updatedAt: new Date() };
+    if (mappedStatus) update.status = mappedStatus;
+    if (mappedStatus === 'driver_assigned') update.driverAssignedAt = new Date();
+    if (mappedStatus === 'out_for_delivery') update.pickedUpAt = new Date();
+    if (mappedStatus === 'delivered') update.deliveredAt = new Date();
+    if (mappedStatus === 'delivery_failed') update.deliveryFailureReason = 'Uber Direct delivery cancelled';
+
+    await db.collection('orders').updateOne({ orderNumber: order.orderNumber }, { $set: update });
+
+    if (mappedStatus) {
+      broadcastToAdmins({ type: 'order_status_changed', order: { orderNumber: order.orderNumber, status: mappedStatus } });
+      broadcastToCustomer(order.userId, { type: 'order_status_changed', order: { orderNumber: order.orderNumber, status: mappedStatus, updatedAt: update.updatedAt } });
+    } else {
+      console.log('Uber Direct webhook: unrecognized status', event.status, 'for order', order.orderNumber);
+    }
+
+    res.status(200).json({ received: true });
+  } catch (error) {
+    console.error('Uber Direct webhook error:', error.message);
+    // Still ack with 200 where possible to avoid Uber's retry storm for our
+    // own bugs, but a malformed/unverifiable request gets a 400.
+    res.status(400).json({ error: 'Webhook processing failed' });
+  }
+});
 
 const sseClients = {
   admin: new Set(),
