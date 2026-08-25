@@ -10,6 +10,7 @@ const courierGuy = require('./providers/courierGuy');
 const pargo = require('./providers/pargo');
 const pudo = require('./providers/pudo');
 const localCourier = require('./providers/localCourier');
+const inDrive = require('./providers/inDrive');
 
 const PROVIDERS = {
   own_delivery: ownDelivery,
@@ -17,7 +18,8 @@ const PROVIDERS = {
   courier_guy: courierGuy,
   pargo: pargo,
   pudo: pudo,
-  local_courier: localCourier
+  local_courier: localCourier,
+  indrive: inDrive
 };
 
 const DEFAULT_ENABLED = ['own_delivery', 'uber_direct', 'courier_guy', 'pargo', 'pudo'];
