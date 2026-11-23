@@ -253,17 +253,26 @@ async function sendOrderConfirmationEmail(order) {
       `• ${i.name} x${i.quantity} - R${(i.price * i.quantity).toFixed(2)}`
     ).join('<br>');
 
+    let providerLabel = 'Home Delivery';
+    if (order.deliveryProvider) {
+      try {
+        providerLabel = deliveryEngine.getProvider(order.deliveryProvider).name;
+      } catch {
+        providerLabel = order.deliveryProvider;
+      }
+    }
+
     // ✅ DELIVERY METHOD DISPLAY
     const deliveryInfo = order.deliveryMethod === 'delivery'
-      ? `<p><strong>Delivery Method:</strong> 🚚 Home Delivery</p>
+      ? `<p><strong>Delivery Method:</strong> 🚚 ${providerLabel}</p>
          ${order.address ? `<p><strong>Delivery Address:</strong><br>${order.address}</p>` : ''}`
       : `<p><strong>Delivery Method:</strong> 🏪 Store Pickup</p>
          <div style="background:#E0F2FE;padding:15px;border-radius:8px;border-left:4px solid #0284C7;margin-top:10px">
            <p style="margin:0;font-size:14px;color:#075985">
              <strong>📍 Pickup Location:</strong><br>
              Portugal Bakery<br>
-             123 Main Street, Johannesburg<br>
-             Mon-Sat: 7:00 AM - 6:00 PM | Sun: 8:00 AM - 2:00 PM
+             245 Johannesburg Rd, La Rochelle, Johannesburg South, 2190<br>
+             Mon-Fri: 6:45 AM - 4:00 PM | Sat: 6:45 AM - 2:00 PM
            </p>
          </div>`;
 
@@ -1109,7 +1118,8 @@ app.post('/api/orders', authenticateToken, [
       userId: req.user._id,
       orderNumber: generateOrderNumber(),
       status: 'pending',
-      paymentStatus: 'pending',
+      paymentStatus: req.body.paymentID ? 'paid' : 'pending',
+      paymentID: req.body.paymentID || null,
       items,
       totalAmount,
       phone: customerPhone,
@@ -1401,7 +1411,9 @@ app.put('/api/admin/delivery-settings', authenticateAdmin, [
   body('minimumOrderForDelivery').optional({ nullable: true }).isFloat({ min: 0 })
 ], validate, async (req, res) => {
   try {
-    const update = {};
+    const update = {
+      knownProviders: deliveryEngine.ALL_PROVIDER_IDS
+    };
     if (req.body.enabledProviders) update.enabledProviders = req.body.enabledProviders;
     if ('freeDeliveryThreshold' in req.body) update.freeDeliveryThreshold = req.body.freeDeliveryThreshold;
     if ('minimumOrderForDelivery' in req.body) update.minimumOrderForDelivery = req.body.minimumOrderForDelivery;
@@ -1469,8 +1481,8 @@ app.post('/api/orders/:orderNumber/request-courier', authenticateAdmin, [
   try {
     const order = await db.collection('orders').findOne({ orderNumber });
     if (!order) return res.status(404).json({ error: 'Order not found' });
-    if (order.paymentStatus !== 'paid') {
-      return res.status(400).json({ error: 'Cannot request courier - order is not paid' });
+    if (order.paymentStatus === 'payment_failed' || order.status === 'cancelled') {
+      return res.status(400).json({ error: 'Cannot request courier - order is cancelled or payment failed' });
     }
     if (!order.address) {
       return res.status(400).json({ error: 'Cannot request courier - order has no delivery address' });
@@ -1588,6 +1600,77 @@ app.post('/api/orders/:orderNumber/switch-provider', authenticateAdmin, [
     res.json({ ...updated, _id: updated._id.toString(), userId: updated.userId.toString() });
   } catch (error) {
     handleError(res, error, 'Failed to switch delivery provider');
+  }
+});
+
+// Staff attach/update live courier tracking link, waybill & driver details
+// (e.g. Uber Package / Bolt Send / inDrive / Yassir shareable trip link, or
+// Courier Guy / RAM / PUDO / Pargo waybill URL) and broadcast to customer.
+app.put('/api/orders/:orderNumber/delivery-tracking', authenticateAdmin, [
+  param('orderNumber').matches(/^PB-[A-Z0-9]{8}-[A-Z0-9]{4}$/),
+  body('trackingUrl').optional({ nullable: true }).isString(),
+  body('waybillNumber').optional({ nullable: true }).isString(),
+  body('driverName').optional({ nullable: true }).isString(),
+  body('driverPhone').optional({ nullable: true }).isString(),
+  body('driverVehicle').optional({ nullable: true }).isString(),
+  body('status').optional().isIn([
+    'courier_requested', 'driver_assigned', 'driver_arriving', 'out_for_delivery', 'delivered'
+  ])
+], validate, async (req, res) => {
+  try {
+    const { orderNumber } = req.params;
+    const order = await db.collection('orders').findOne({ orderNumber });
+    if (!order) return res.status(404).json({ error: 'Order not found' });
+
+    const existingDriver = order.driverDetails || {};
+    const nextDriverDetails = {
+      name: req.body.driverName !== undefined ? (req.body.driverName?.trim() || null) : (existingDriver.name || null),
+      phone: req.body.driverPhone !== undefined ? (req.body.driverPhone?.trim() || null) : (existingDriver.phone || null),
+      vehicle: req.body.driverVehicle !== undefined ? (req.body.driverVehicle?.trim() || null) : (existingDriver.vehicle || null),
+    };
+    const hasDriverDetails = Boolean(nextDriverDetails.name || nextDriverDetails.phone || nextDriverDetails.vehicle);
+
+    const updateFields = {
+      updatedAt: new Date(),
+      driverDetails: hasDriverDetails ? nextDriverDetails : null
+    };
+
+    if (req.body.trackingUrl !== undefined) {
+      updateFields.trackingUrl = req.body.trackingUrl?.trim() || null;
+    }
+    if (req.body.waybillNumber !== undefined) {
+      updateFields.providerDeliveryId = req.body.waybillNumber?.trim() || order.providerDeliveryId || null;
+    }
+    if (req.body.status) {
+      updateFields.status = req.body.status;
+    } else if (hasDriverDetails && ['ready_for_delivery', 'courier_requested'].includes(order.status)) {
+      updateFields.status = 'driver_assigned';
+    }
+    if (hasDriverDetails && !order.driverAssignedAt) {
+      updateFields.driverAssignedAt = new Date();
+    }
+
+    await db.collection('orders').updateOne(
+      { orderNumber },
+      { $set: updateFields }
+    );
+
+    const updated = await db.collection('orders').findOne({ orderNumber });
+    const eventPayload = {
+      orderNumber,
+      status: updated.status,
+      trackingUrl: updated.trackingUrl,
+      driverDetails: updated.driverDetails,
+      deliveryProvider: updated.deliveryProvider,
+      updatedAt: updated.updatedAt
+    };
+
+    broadcastToAdmins({ type: 'order_status_changed', order: eventPayload });
+    broadcastToCustomer(order.userId, { type: 'order_status_changed', order: eventPayload });
+
+    res.json({ ...updated, _id: updated._id.toString(), userId: updated.userId.toString() });
+  } catch (error) {
+    handleError(res, error, 'Failed to update delivery tracking details');
   }
 });
 

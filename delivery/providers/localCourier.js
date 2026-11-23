@@ -1,50 +1,20 @@
 // delivery/providers/localCourier.js
-//
-// Architecture-only stub for a future local Johannesburg motorbike courier.
-// No provider has been selected yet, so this never fabricates an
-// integration. Disabled by default (see delivery_settings in the DB).
-// Once a real provider/API is chosen, either wire up their API here the
-// same way uberDirect.js does, or implement the "manual dispatch" flow:
-// staff click REQUEST LOCAL COURIER and the system records a delivery
-// request with the order's details for a human to action by phone/app.
+// Neighbourhood Local Motorbike Courier — optional local bike rider (toggleable in Admin).
 
-const localCourier = {
+const { createRateCardProvider } = require('./rateCardProvider');
+
+const localCourier = createRateCardProvider({
   id: 'local_courier',
   name: 'Local Motorbike Courier',
+  category: 'on_demand',
+  description: 'Direct neighbourhood bike courier for Johannesburg South & nearby suburbs',
+  bookingUrl: null,
   serviceType: 'on_demand_door_to_door',
-  capabilities: ['on_demand', 'same_day', 'door_to_door', 'manual_dispatch'],
-
-  isConfigured() {
-    // Manual dispatch doesn't need API credentials, but the provider must
-    // still be explicitly enabled in delivery settings before it's offered.
-    return false;
-  },
-
-  async checkAvailability() {
-    return { available: false, reason: 'No local courier provider selected yet.' };
-  },
-
-  async getQuote() {
-    return null;
-  },
-
-  // Manual-dispatch flow: record the request, no external API call.
-  async createDelivery(order) {
-    return {
-      providerDeliveryId: null,
-      trackingUrl: null,
-      status: 'courier_requested',
-      raw: { note: `Manual dispatch requested for order ${order.orderNumber} - contact local courier directly.` }
-    };
-  },
-
-  async cancelDelivery() {
-    return { cancelled: true };
-  },
-
-  async getDeliveryStatus() {
-    return { status: 'unknown', note: 'Local courier has no API tracking - update status manually.' };
-  }
-};
+  capabilities: ['on_demand', 'same_day', 'door_to_door', 'manual_dispatch', 'quote'],
+  maxZone: 3,
+  enabledByDefault: false,
+  zoneFees: { 1: 60, 2: 90, 3: 130, 4: 130, 5: 130, 6: 130 },
+  zoneEtas: { 1: [25, 45], 2: [35, 55], 3: [45, 70], 4: [45, 70], 5: [45, 70], 6: [45, 70] }
+});
 
 module.exports = localCourier;

@@ -1,37 +1,87 @@
 // delivery/engine.js
 //
-// The rest of the application talks to THIS module, never to individual
-// provider adapters directly. This is what lets Portugal Bakery add/remove/
-// swap courier providers later without touching checkout or admin code.
+// Central South African multi-provider delivery engine for Portugal Bakery.
+// Coordinates quotes, eligibility, business rules, and dispatch across
+// in-house, on-demand ride/express, parcel courier, and pickup-locker networks.
 
 const ownDelivery = require('./providers/ownDelivery');
 const uberDirect = require('./providers/uberDirect');
-const courierGuy = require('./providers/courierGuy');
-const pargo = require('./providers/pargo');
-const pudo = require('./providers/pudo');
-const localCourier = require('./providers/localCourier');
+const bolt = require('./providers/bolt');
 const inDrive = require('./providers/inDrive');
+const yassir = require('./providers/yassir');
+const mrD = require('./providers/mrD');
+const droppa = require('./providers/droppa');
+const courierGuy = require('./providers/courierGuy');
+const ram = require('./providers/ram');
+const fastway = require('./providers/fastway');
+const aramex = require('./providers/aramex');
+const pudo = require('./providers/pudo');
+const pargo = require('./providers/pargo');
+const localCourier = require('./providers/localCourier');
 
 const PROVIDERS = {
   own_delivery: ownDelivery,
   uber_direct: uberDirect,
+  bolt,
+  indrive: inDrive,
+  yassir,
+  mr_d: mrD,
+  droppa,
   courier_guy: courierGuy,
-  pargo: pargo,
-  pudo: pudo,
-  local_courier: localCourier,
-  indrive: inDrive
+  ram,
+  fastway,
+  aramex,
+  pudo,
+  pargo,
+  local_courier: localCourier
 };
 
-const DEFAULT_ENABLED = ['own_delivery', 'uber_direct', 'courier_guy', 'pargo', 'pudo'];
+const ALL_PROVIDER_IDS = Object.keys(PROVIDERS);
+
+const DEFAULT_ENABLED = [
+  'own_delivery',
+  'uber_direct',
+  'bolt',
+  'indrive',
+  'yassir',
+  'mr_d',
+  'droppa',
+  'courier_guy',
+  'ram',
+  'fastway',
+  'aramex',
+  'pudo',
+  'pargo'
+];
 
 async function getDeliverySettings(db) {
   const settings = await db.collection('delivery_settings').findOne({ _id: 'default' });
-  if (settings) return settings;
+  if (!settings) {
+    return {
+      _id: 'default',
+      enabledProviders: [...DEFAULT_ENABLED],
+      knownProviders: [...ALL_PROVIDER_IDS],
+      freeDeliveryThreshold: null,
+      minimumOrderForDelivery: null
+    };
+  }
+
+  // Auto-enable newly introduced default SA providers if the existing DB
+  // settings document predates them, while preserving any provider the admin
+  // already knew about and explicitly toggled off.
+  const known = new Set(Array.isArray(settings.knownProviders) ? settings.knownProviders : []);
+  const enabled = new Set(Array.isArray(settings.enabledProviders) ? settings.enabledProviders : DEFAULT_ENABLED);
+
+  for (const id of DEFAULT_ENABLED) {
+    if (!known.has(id)) {
+      enabled.add(id);
+    }
+  }
+
   return {
-    _id: 'default',
-    enabledProviders: DEFAULT_ENABLED,
-    freeDeliveryThreshold: null, // e.g. 500 = free delivery above R500, null = disabled
-    minimumOrderForDelivery: null
+    ...settings,
+    enabledProviders: Array.from(enabled),
+    knownProviders: [...ALL_PROVIDER_IDS]
   };
 }
 
@@ -45,15 +95,16 @@ function listAllProviders() {
   return Object.values(PROVIDERS).map(p => ({
     id: p.id,
     name: p.name,
+    category: p.category || 'courier',
+    description: p.description || '',
+    bookingUrl: p.bookingUrl || null,
     serviceType: p.serviceType,
     capabilities: p.capabilities,
-    configured: p.isConfigured()
+    configured: p.isConfigured(),
+    dispatchMode: typeof p.getDispatchMode === 'function' ? p.getDispatchMode() : 'managed_dispatch'
   }));
 }
 
-// Does this order's items allow this provider, based on optional per-product
-// deliveryEligibility (an array of required capabilities). Products with no
-// deliveryEligibility field are eligible for every provider.
 function isProviderEligibleForItems(provider, items = []) {
   for (const item of items) {
     const required = item.deliveryEligibility;
@@ -65,9 +116,6 @@ function isProviderEligibleForItems(provider, items = []) {
 }
 
 // context: { db, address, latitude, longitude, subtotal, items }
-// Returns quotes only from providers that are: enabled in settings,
-// configured (or own_delivery, which is always configured), available for
-// this context, and eligible for the items in the cart.
 async function getQuotes(context) {
   const { db, items = [] } = context;
   const settings = await getDeliverySettings(db);
@@ -88,40 +136,39 @@ async function getQuotes(context) {
       if (quote) results.push(quote);
     } catch (err) {
       console.error(`Quote failed for provider ${id}:`, err.message);
-      // Skip this provider rather than failing the whole comparison.
     }
   }
 
   // Apply free-delivery threshold if configured.
   if (settings.freeDeliveryThreshold && context.subtotal >= settings.freeDeliveryThreshold) {
-    results.forEach(q => { q.originalFee = q.fee; q.fee = 0; q.freeDelivery = true; });
+    results.forEach(q => {
+      q.originalFee = q.fee;
+      q.fee = 0;
+      q.freeDelivery = true;
+    });
   }
 
-  // Dynamic labels - computed from what's actually being compared, never
-  // hard-coded or asserted without checking the alternatives.
+  // Dynamic comparison labels computed across actual returned quotes.
   if (results.length > 0) {
-    const cheapest = results.reduce((a, b) => (b.fee < a.fee ? b : a));
-    const fastest = results.reduce((a, b) => {
-      const aTime = a.etaMinutesMax ?? Infinity;
-      const bTime = b.etaMinutesMax ?? Infinity;
-      return bTime < aTime ? b : a;
-    });
+    const doorToDoor = results.filter(q => q.serviceType !== 'pickup_point');
+    const cheapestPool = doorToDoor.length > 0 ? doorToDoor : results;
+    const minFee = Math.min(...cheapestPool.map(q => q.fee));
+    const minEta = Math.min(...results.map(q => q.etaMinutesMax ?? Infinity));
+
     results.forEach(q => {
       q.labels = [];
-      if (q.providerId === cheapest.providerId) q.labels.push('CHEAPEST');
-      if (q.providerId === fastest.providerId) q.labels.push('FASTEST');
+      if (q.fee === minFee && q.serviceType !== 'pickup_point') q.labels.push('CHEAPEST');
+      if (q.serviceType === 'pickup_point' && q.fee <= minFee) q.labels.push('LOWEST LOCKER FEE');
+      if ((q.etaMinutesMax ?? Infinity) === minEta) q.labels.push('FASTEST');
+      if (q.providerId === 'own_delivery' || q.providerId === 'droppa') q.labels.push('BEST FOR CAKES');
       if (q.serviceType === 'pickup_point') q.labels.push('PICKUP POINT');
-      if (q.serviceType === 'standard_parcel') q.labels.push('STANDARD');
+      if (q.serviceType === 'same_day_door_to_door') q.labels.push('SAME DAY');
     });
   }
 
   return results;
 }
 
-// Verifies preconditions and dispatches the selected provider. Duplicate
-// protection is enforced by the caller using an atomic findOneAndUpdate
-// condition (see server.js) - this function assumes that guard already
-// passed and just talks to the provider.
 async function requestCourier(providerId, order) {
   const provider = getProvider(providerId);
   if (!provider.isConfigured()) {
@@ -142,6 +189,8 @@ async function getCourierStatus(providerId, providerDeliveryId) {
 
 module.exports = {
   PROVIDERS,
+  ALL_PROVIDER_IDS,
+  DEFAULT_ENABLED,
   getProvider,
   listAllProviders,
   getDeliverySettings,

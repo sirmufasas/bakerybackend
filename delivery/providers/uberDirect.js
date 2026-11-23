@@ -1,37 +1,27 @@
 // delivery/providers/uberDirect.js
 //
-// Real Uber Direct integration, based on Uber's current published API:
-//   Auth:    POST https://auth.uber.com/oauth/v2/token   (client_credentials, scope=eats.deliveries)
-//   Quote:   POST https://api.uber.com/v1/customers/{customer_id}/delivery_quotes
-//   Deliver: POST https://api.uber.com/v1/customers/{customer_id}/deliveries
-//   Cancel:  POST https://api.uber.com/v1/customers/{customer_id}/deliveries/{delivery_id}/cancel
-//   Status:  GET  https://api.uber.com/v1/customers/{customer_id}/deliveries/{delivery_id}
-//   Webhook: header `x-uber-signature` = hex HMAC-SHA256(body, signing_key)
-//
-// This adapter is INERT (isConfigured() === false) unless the following
-// environment variables are set on the backend:
-//   UBER_DIRECT_CLIENT_ID
-//   UBER_DIRECT_CLIENT_SECRET
-//   UBER_DIRECT_CUSTOMER_ID
-//   UBER_DIRECT_WEBHOOK_SIGNING_KEY   (only required to receive webhooks)
-//   PORTUGAL_BAKERY_PICKUP_ADDRESS_JSON  e.g. {"street_address":["123 Main Rd"],"city":"Johannesburg","state":"GT","zip_code":"2190","country":"ZA"}
-//   PORTUGAL_BAKERY_PICKUP_LAT / PORTUGAL_BAKERY_PICKUP_LNG
-//   PORTUGAL_BAKERY_PICKUP_PHONE
-//
-// Nothing here fabricates a quote, delivery, or tracking info - if the
-// credentials are missing or Uber's API errors, callers get a clear error,
-// never fake data.
+// Dual-mode Uber Package / Uber Direct integration:
+//  - When UBER_DIRECT_CLIENT_ID + UBER_DIRECT_CLIENT_SECRET + UBER_DIRECT_CUSTOMER_ID
+//    are configured on the server, uses Uber's live OAuth + Delivery Quotes +
+//    Deliveries REST API + HMAC-verified webhooks.
+//  - Otherwise, runs immediately in Gauteng Uber Package rate-card + staff
+//    dispatch mode so customers can select Uber at checkout today and staff
+//    can dispatch via Uber Package / Uber Direct dashboard and attach the
+//    live trip tracking link.
+
+const { createRateCardProvider } = require('./rateCardProvider');
 
 const AUTH_URL = 'https://auth.uber.com/oauth/v2/token';
 const API_BASE = 'https://api.uber.com/v1';
 
-let cachedToken = null; // { access_token, expiresAt }
+let cachedToken = null;
 
-function isConfigured() {
+function hasLiveCredentials() {
   return Boolean(
     process.env.UBER_DIRECT_CLIENT_ID &&
     process.env.UBER_DIRECT_CLIENT_SECRET &&
-    process.env.UBER_DIRECT_CUSTOMER_ID
+    process.env.UBER_DIRECT_CUSTOMER_ID &&
+    process.env.PORTUGAL_BAKERY_PICKUP_ADDRESS_JSON
   );
 }
 
@@ -90,86 +80,100 @@ async function uberFetch(path, options = {}) {
   return data;
 }
 
-function getPickupAddress() {
-  const json = process.env.PORTUGAL_BAKERY_PICKUP_ADDRESS_JSON;
-  if (!json) throw new Error('PORTUGAL_BAKERY_PICKUP_ADDRESS_JSON is not configured');
-  return json; // already a JSON string, as Uber's API expects
-}
-
-const uberDirect = {
+const fallbackAdapter = createRateCardProvider({
   id: 'uber_direct',
-  name: 'Uber Direct',
+  name: 'Uber Package (Uber Direct)',
+  category: 'on_demand',
+  description: 'Fast on-demand motorbike/car delivery across Johannesburg',
+  bookingUrl: 'https://m.uber.com/',
   serviceType: 'on_demand_door_to_door',
   capabilities: ['door_to_door', 'on_demand', 'same_day', 'quote', 'tracking', 'driver_info', 'webhooks'],
+  apiKeyEnv: ['UBER_DIRECT_CLIENT_ID', 'UBER_DIRECT_CLIENT_SECRET', 'UBER_DIRECT_CUSTOMER_ID'],
+  zoneFees: { 1: 65, 2: 95, 3: 135, 4: 175, 5: 230, 6: 310 },
+  zoneEtas: { 1: [20, 35], 2: [25, 45], 3: [30, 50], 4: [35, 60], 5: [45, 75], 6: [60, 95] }
+});
 
-  isConfigured,
+const uberDirect = {
+  ...fallbackAdapter,
 
-  async checkAvailability() {
-    if (!isConfigured()) {
-      return { available: false, reason: 'Provider integration configured but awaiting credentials.' };
-    }
-    return { available: true };
+  hasLiveApiCredentials: hasLiveCredentials,
+
+  getDispatchMode() {
+    return hasLiveCredentials() ? 'live_api' : 'managed_dispatch';
   },
 
-  // context: { address, latitude, longitude, subtotal }
+  isConfigured() {
+    return true;
+  },
+
+  async checkAvailability(context) {
+    return fallbackAdapter.checkAvailability(context);
+  },
+
   async getQuote(context) {
-    if (!isConfigured()) return null;
-
-    const customerId = process.env.UBER_DIRECT_CUSTOMER_ID;
-    const dropoffAddress = JSON.stringify({
-      street_address: [context.address],
-      city: context.city || '',
-      state: context.state || 'GT',
-      zip_code: context.zipCode || '',
-      country: 'ZA'
-    });
-
-    const body = {
-      pickup_address: getPickupAddress(),
-      dropoff_address: dropoffAddress
-    };
-    if (context.latitude && context.longitude) {
-      body.dropoff_latitude = context.latitude;
-      body.dropoff_longitude = context.longitude;
-    }
-    if (process.env.PORTUGAL_BAKERY_PICKUP_LAT && process.env.PORTUGAL_BAKERY_PICKUP_LNG) {
-      body.pickup_latitude = Number(process.env.PORTUGAL_BAKERY_PICKUP_LAT);
-      body.pickup_longitude = Number(process.env.PORTUGAL_BAKERY_PICKUP_LNG);
+    if (!hasLiveCredentials()) {
+      return fallbackAdapter.getQuote(context);
     }
 
-    const quote = await uberFetch(`/customers/${customerId}/delivery_quotes`, {
-      method: 'POST',
-      body: JSON.stringify(body)
-    });
+    try {
+      const customerId = process.env.UBER_DIRECT_CUSTOMER_ID;
+      const dropoffAddress = JSON.stringify({
+        street_address: [context.address],
+        city: context.city || 'Johannesburg',
+        state: context.state || 'GT',
+        zip_code: context.zipCode || '',
+        country: 'ZA'
+      });
 
-    return {
-      providerId: this.id,
-      providerName: this.name,
-      fee: quote.fee / 100, // Uber returns fee in cents
-      currency: (quote.currency_type || 'ZAR'),
-      etaMinutesMin: quote.duration,
-      etaMinutesMax: quote.duration,
-      quoteId: quote.id,
-      quoteExpiresAt: quote.expires,
-      serviceType: this.serviceType,
-      raw: quote
-    };
+      const body = {
+        pickup_address: process.env.PORTUGAL_BAKERY_PICKUP_ADDRESS_JSON,
+        dropoff_address: dropoffAddress
+      };
+      if (context.latitude && context.longitude) {
+        body.dropoff_latitude = context.latitude;
+        body.dropoff_longitude = context.longitude;
+      }
+      if (process.env.PORTUGAL_BAKERY_PICKUP_LAT && process.env.PORTUGAL_BAKERY_PICKUP_LNG) {
+        body.pickup_latitude = Number(process.env.PORTUGAL_BAKERY_PICKUP_LAT);
+        body.pickup_longitude = Number(process.env.PORTUGAL_BAKERY_PICKUP_LNG);
+      }
+
+      const quote = await uberFetch(`/customers/${customerId}/delivery_quotes`, {
+        method: 'POST',
+        body: JSON.stringify(body)
+      });
+
+      return {
+        providerId: this.id,
+        providerName: this.name,
+        category: this.category,
+        description: this.description,
+        bookingUrl: this.bookingUrl,
+        dispatchMode: 'live_api',
+        fee: quote.fee / 100,
+        currency: quote.currency_type || 'ZAR',
+        etaMinutesMin: quote.duration,
+        etaMinutesMax: quote.duration,
+        quoteId: quote.id,
+        quoteExpiresAt: quote.expires,
+        serviceType: this.serviceType,
+        raw: quote
+      };
+    } catch (err) {
+      console.warn('Uber Direct live quote failed, falling back to Gauteng rate card:', err.message);
+      return fallbackAdapter.getQuote(context);
+    }
   },
 
-  // order must include a valid, unexpired quoteId from getQuote(), plus
-  // dropoff details.
   async createDelivery(order) {
-    if (!isConfigured()) {
-      throw new Error('Uber Direct is not configured - missing credentials.');
-    }
-    if (!order.deliveryQuoteId) {
-      throw new Error('No active Uber Direct quote for this order - request a fresh quote before dispatch.');
+    if (!hasLiveCredentials() || !order.deliveryQuoteId || String(order.deliveryQuoteId).startsWith('uber_direct_z')) {
+      return fallbackAdapter.createDelivery(order);
     }
 
     const customerId = process.env.UBER_DIRECT_CUSTOMER_ID;
     const dropoffAddress = JSON.stringify({
       street_address: [order.address],
-      city: order.city || '',
+      city: order.city || 'Johannesburg',
       state: order.state || 'GT',
       zip_code: order.zipCode || '',
       country: 'ZA'
@@ -177,9 +181,9 @@ const uberDirect = {
 
     const body = {
       quote_id: order.deliveryQuoteId,
-      pickup_address: getPickupAddress(),
+      pickup_address: process.env.PORTUGAL_BAKERY_PICKUP_ADDRESS_JSON,
       pickup_name: 'Portugal Bakery',
-      pickup_phone_number: process.env.PORTUGAL_BAKERY_PICKUP_PHONE,
+      pickup_phone_number: process.env.PORTUGAL_BAKERY_PICKUP_PHONE || '+27114362396',
       dropoff_address: dropoffAddress,
       dropoff_name: order.customerName || 'Customer',
       dropoff_phone_number: order.phone,
@@ -201,14 +205,18 @@ const uberDirect = {
   },
 
   async cancelDelivery(providerDeliveryId) {
-    if (!isConfigured()) throw new Error('Uber Direct is not configured.');
+    if (!hasLiveCredentials() || !providerDeliveryId || String(providerDeliveryId).startsWith('UBER_DIRECT-')) {
+      return fallbackAdapter.cancelDelivery(providerDeliveryId);
+    }
     const customerId = process.env.UBER_DIRECT_CUSTOMER_ID;
     await uberFetch(`/customers/${customerId}/deliveries/${providerDeliveryId}/cancel`, { method: 'POST' });
     return { cancelled: true };
   },
 
   async getDeliveryStatus(providerDeliveryId) {
-    if (!isConfigured()) throw new Error('Uber Direct is not configured.');
+    if (!hasLiveCredentials() || !providerDeliveryId || String(providerDeliveryId).startsWith('UBER_DIRECT-')) {
+      return fallbackAdapter.getDeliveryStatus(providerDeliveryId);
+    }
     const customerId = process.env.UBER_DIRECT_CUSTOMER_ID;
     const delivery = await uberFetch(`/customers/${customerId}/deliveries/${providerDeliveryId}`);
     return {
@@ -226,25 +234,17 @@ const uberDirect = {
     };
   },
 
-  // Verifies the `x-uber-signature` header: hex HMAC-SHA256 of the raw
-  // request body using the webhook signing key. rawBody must be the exact
-  // raw bytes/string Uber sent (not a re-serialized JSON.stringify of the
-  // parsed body), per Uber's own documented caveat about JS backslash
-  // handling.
   verifyWebhook(rawBody, signatureHeader) {
     const signingKey = process.env.UBER_DIRECT_WEBHOOK_SIGNING_KEY;
     if (!signingKey || !signatureHeader) return false;
     const crypto = require('crypto');
     const digest = crypto.createHmac('sha256', signingKey).update(rawBody).digest('hex');
-    // constant-time compare
     const a = Buffer.from(digest);
     const b = Buffer.from(signatureHeader);
     if (a.length !== b.length) return false;
     return crypto.timingSafeEqual(a, b);
   },
 
-  // Maps Uber's webhook event payload to our internal shape. Only reads
-  // fields Uber actually documents - never fabricates data.
   parseWebhookEvent(payload) {
     return {
       providerDeliveryId: payload.delivery_id || payload?.data?.id || null,

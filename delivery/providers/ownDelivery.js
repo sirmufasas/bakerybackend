@@ -1,59 +1,19 @@
 // delivery/providers/ownDelivery.js
-// Portugal Bakery's own zone-based delivery (the system that already existed
-// before this delivery engine was added). Always available - no external
-// API/credentials required. Serves as the guaranteed fallback provider.
+// Portugal Bakery's own in-house zone-based delivery van/driver.
+// Safest option for multi-tier cakes, fragile pastries & large catering orders.
 
-const { calculateZoneFee } = require('../zones');
+const { createRateCardProvider } = require('./rateCardProvider');
 
-const ownDelivery = {
+const ownDelivery = createRateCardProvider({
   id: 'own_delivery',
   name: 'Portugal Bakery Delivery',
+  category: 'in_house',
+  description: 'In-house bakery van • Careful handling for cakes & large orders',
+  bookingUrl: null,
   serviceType: 'standard',
-  capabilities: ['door_to_door', 'standard', 'tracking_manual'],
-
-  isConfigured() {
-    return true; // no external credentials needed
-  },
-
-  async checkAvailability() {
-    return { available: true };
-  },
-
-  async getQuote({ address }) {
-    const { fee, zone, found } = calculateZoneFee(address);
-    return {
-      providerId: this.id,
-      providerName: this.name,
-      fee,
-      currency: 'ZAR',
-      etaMinutesMin: 60,
-      etaMinutesMax: 180,
-      zone,
-      addressRecognized: found,
-      serviceType: this.serviceType,
-      quoteId: null // no external quote to expire/redeem
-    };
-  },
-
-  // No external API call - order stays with own_delivery until staff
-  // manually update its status. Returns a shape consistent with the other
-  // providers so the calling code doesn't need to special-case this one.
-  async createDelivery(order) {
-    return {
-      providerDeliveryId: null,
-      trackingUrl: null,
-      status: 'courier_requested',
-      raw: { note: 'Own delivery - dispatched manually by bakery staff, no external courier API involved.' }
-    };
-  },
-
-  async cancelDelivery() {
-    return { cancelled: true };
-  },
-
-  async getDeliveryStatus() {
-    return { status: 'unknown', note: 'Own delivery has no external tracking - update status manually.' };
-  }
-};
+  capabilities: ['door_to_door', 'standard', 'fragile_cakes', 'bulk_orders', 'tracking_manual'],
+  zoneFees: { 1: 150, 2: 200, 3: 350, 4: 400, 5: 450, 6: 500 },
+  zoneEtas: { 1: [45, 90], 2: [60, 120], 3: [75, 140], 4: [90, 160], 5: [100, 180], 6: [120, 210] }
+});
 
 module.exports = ownDelivery;
