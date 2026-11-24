@@ -1193,6 +1193,8 @@ async function finalizePaidOrderFromSession(sessionDoc, verificationResult) {
     deliveryMethod: orderDraft.deliveryMethod,
     deliveryFee: orderDraft.deliveryFee || 0,
     deliveryZone: orderDraft.deliveryZone || '',
+    customerLat: typeof orderDraft.customerLat === 'number' ? orderDraft.customerLat : null,
+    customerLng: typeof orderDraft.customerLng === 'number' ? orderDraft.customerLng : null,
     shippingAddress: orderDraft.shippingAddress || orderDraft.customerAddress || '',
     specialInstructions: orderDraft.specialInstructions || '',
     deliveryProvider: orderDraft.deliveryMethod === 'delivery'
@@ -1313,6 +1315,8 @@ app.post(
         customerEmail,
         customerPhone,
         customerAddress,
+        customerLat,
+        customerLng,
         shippingAddress,
         specialInstructions,
         deliveryMethod,
@@ -1347,6 +1351,8 @@ app.post(
         customerEmail: payerEmail,
         customerPhone: customerPhone.trim(),
         customerAddress: deliveryMethod === 'delivery' ? customerAddress.trim() : '',
+        customerLat: Number.isFinite(Number(customerLat)) ? Number(customerLat) : null,
+        customerLng: Number.isFinite(Number(customerLng)) ? Number(customerLng) : null,
         shippingAddress:
           deliveryMethod === 'delivery'
             ? (shippingAddress || customerAddress).trim()
@@ -1899,6 +1905,149 @@ app.get('/api/delivery/route', async (req, res) => {
     });
   } catch (error) {
     handleError(res, error, 'Failed to compute street route');
+  }
+});
+
+// Uber-style South African street & address autocomplete proxy
+app.get('/api/delivery/address-search', async (req, res) => {
+  try {
+    const q = String(req.query.q || '').trim();
+    if (q.length < 2) {
+      return res.json({ suggestions: [] });
+    }
+    const biasLat = Number.isFinite(parseFloat(req.query.lat)) ? parseFloat(req.query.lat) : BAKERY_ORIGIN_LAT;
+    const biasLng = Number.isFinite(parseFloat(req.query.lng)) ? parseFloat(req.query.lng) : BAKERY_ORIGIN_LNG;
+
+    const searchQ = q.toLowerCase().includes('south africa') ? q : `${q}, South Africa`;
+    const headers = {
+      Accept: 'application/json',
+      'User-Agent': 'PortugalBakeryPortal/1.0 (https://portubakery.netlify.app)',
+    };
+
+    const [nomRes, photonRes] = await Promise.allSettled([
+      fetch(
+        `https://nominatim.openstreetmap.org/search?format=jsonv2&addressdetails=1&countrycodes=za&viewbox=27.5,-25.5,28.7,-26.8&bounded=0&limit=8&q=${encodeURIComponent(q)}`,
+        { headers }
+      ),
+      fetch(
+        `https://photon.komoot.io/api/?q=${encodeURIComponent(searchQ)}&lat=${biasLat}&lon=${biasLng}&limit=8`,
+        { headers }
+      ),
+    ]);
+
+    const suggestions = [];
+
+    if (nomRes.status === 'fulfilled' && nomRes.value.ok) {
+      const nomItems = await nomRes.value.json();
+      for (const item of nomItems || []) {
+        const lat = parseFloat(item.lat);
+        const lng = parseFloat(item.lon);
+        if (!Number.isFinite(lat) || !Number.isFinite(lng)) continue;
+        const addr = item.address || {};
+        const house = addr.house_number || '';
+        const road = addr.road || addr.pedestrian || addr.residential || item.name || '';
+        const suburb = addr.suburb || addr.neighbourhood || addr.quarter || addr.residential || addr.village || '';
+        const city = addr.city || addr.town || addr.municipality?.replace(' Metropolitan Municipality', '') || 'Johannesburg';
+        const postcode = addr.postcode || '';
+        const primaryText = [house, road].filter(Boolean).join(' ').trim() || suburb || item.display_name.split(',')[0];
+        const secondaryText = [suburb, city, postcode].filter(Boolean).join(', ');
+        suggestions.push({
+          id: `nom_${item.place_id}`,
+          primaryText,
+          secondaryText,
+          fullAddress: [primaryText, suburb, city, postcode].filter(Boolean).join(', '),
+          lat,
+          lng,
+        });
+      }
+    }
+
+    if (photonRes.status === 'fulfilled' && photonRes.value.ok) {
+      const pData = await photonRes.value.json();
+      for (const f of pData.features || []) {
+        const props = f.properties || {};
+        if (props.countrycode && props.countrycode.toUpperCase() !== 'ZA') continue;
+        const [lng, lat] = f.geometry?.coordinates || [];
+        if (!Number.isFinite(lat) || !Number.isFinite(lng)) continue;
+        const house = props.housenumber || '';
+        const road = props.street || props.name || '';
+        const suburb = props.locality || props.district?.replace(/Johannesburg Ward \d+/i, '').trim() || '';
+        const city = props.city || props.state || 'Johannesburg';
+        const postcode = props.postcode || '';
+        const primaryText = [house, road].filter(Boolean).join(' ').trim() || suburb;
+        if (!primaryText) continue;
+        suggestions.push({
+          id: `ph_${props.osm_id || `${lat}_${lng}`}`,
+          primaryText,
+          secondaryText: [suburb, city, postcode].filter(Boolean).join(', '),
+          fullAddress: [primaryText, suburb, city, postcode].filter(Boolean).join(', '),
+          lat,
+          lng,
+        });
+      }
+    }
+
+    res.json({ suggestions });
+  } catch (error) {
+    res.json({ suggestions: [] });
+  }
+});
+
+// Reverse-geocode exact GPS / dragged map pin coordinates into street address
+app.get('/api/delivery/reverse-geocode', async (req, res) => {
+  try {
+    const lat = parseFloat(req.query.lat);
+    const lng = parseFloat(req.query.lng);
+    if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
+      return res.status(400).json({ error: 'Valid lat and lng required.' });
+    }
+    const headers = {
+      Accept: 'application/json',
+      'User-Agent': 'PortugalBakeryPortal/1.0 (https://portubakery.netlify.app)',
+    };
+
+    try {
+      const nomRes = await fetch(
+        `https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=${lat}&lon=${lng}&zoom=18&addressdetails=1`,
+        { headers }
+      );
+      if (nomRes.ok) {
+        const data = await nomRes.json();
+        const addr = data.address || {};
+        const house = addr.house_number || '';
+        const road = addr.road || addr.pedestrian || addr.residential || data.name || '';
+        const suburb = addr.suburb || addr.neighbourhood || addr.quarter || addr.village || '';
+        const city = addr.city || addr.town || 'Johannesburg';
+        const postcode = addr.postcode || '';
+        const streetPart = [house, road].filter(Boolean).join(' ').trim();
+        const formatted = [streetPart, suburb, city, postcode].filter(Boolean).join(', ');
+        if (formatted) {
+          return res.json({ address: formatted, lat, lng, suburb, city, postcode });
+        }
+      }
+    } catch {
+      // Fallback to Photon reverse below
+    }
+
+    const phRes = await fetch(`https://photon.komoot.io/reverse?lat=${lat}&lon=${lng}`, { headers });
+    if (phRes.ok) {
+      const phData = await phRes.json();
+      const props = phData?.features?.[0]?.properties;
+      if (props) {
+        const streetPart = [props.housenumber, props.street || props.name].filter(Boolean).join(' ').trim();
+        const suburb = props.locality || '';
+        const city = props.city || 'Johannesburg';
+        const postcode = props.postcode || '';
+        const formatted = [streetPart, suburb, city, postcode].filter(Boolean).join(', ');
+        if (formatted) {
+          return res.json({ address: formatted, lat, lng, suburb, city, postcode });
+        }
+      }
+    }
+
+    res.json({ address: `${lat.toFixed(5)}, ${lng.toFixed(5)}, Johannesburg`, lat, lng });
+  } catch (error) {
+    handleError(res, error, 'Failed to reverse geocode coordinates');
   }
 });
 

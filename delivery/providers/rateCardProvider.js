@@ -55,8 +55,8 @@ function createRateCardProvider(config) {
       return true;
     },
 
-    async checkAvailability({ address }) {
-      const { zoneNumber } = calculateZoneDetails(address);
+    async checkAvailability({ address, latitude, longitude }) {
+      const { zoneNumber } = calculateZoneDetails(address, latitude, longitude);
       if (zoneNumber > maxZone) {
         return {
           available: false,
@@ -66,8 +66,8 @@ function createRateCardProvider(config) {
       return { available: true };
     },
 
-    async getQuote({ address }) {
-      const { zone, found, zoneNumber } = calculateZoneDetails(address);
+    async getQuote({ address, latitude, longitude }) {
+      const { zone, found, zoneNumber } = calculateZoneDetails(address, latitude, longitude);
       if (zoneNumber > maxZone) return null;
 
       const fee = zoneFees[zoneNumber] ?? zoneFees[6];

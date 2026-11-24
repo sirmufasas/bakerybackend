@@ -3,10 +3,13 @@
 // Single source of truth for distance/zone tiers around Portugal Bakery
 // (245 Johannesburg Rd, La Rochelle, Johannesburg South, 2190).
 
+const BAKERY_COORDS = { lat: -26.2425, lng: 28.0558 };
+
 const DELIVERY_ZONES = [
   {
     zoneNumber: 1,
     name: "Zone 1 - Local (0-5km)",
+    maxKm: 5,
     fee: 150,
     suburbs: [
       "rosettenville", "la rochelle", "turffontein", "malvern", "denver",
@@ -18,6 +21,7 @@ const DELIVERY_ZONES = [
   {
     zoneNumber: 2,
     name: "Zone 2 - Near (5-10km)",
+    maxKm: 10,
     fee: 200,
     suburbs: [
       "alberton", "meyerton", "germiston", "city deep", "kensington",
@@ -31,6 +35,7 @@ const DELIVERY_ZONES = [
   {
     zoneNumber: 3,
     name: "Zone 3 - Medium (10-15km)",
+    maxKm: 15,
     fee: 350,
     suburbs: [
       "benoni", "boksburg", "brakpan", "springs", "edenvale", "bedfordview",
@@ -48,6 +53,7 @@ const DELIVERY_ZONES = [
   {
     zoneNumber: 4,
     name: "Zone 4 - Far (15-20km)",
+    maxKm: 20,
     fee: 400,
     suburbs: [
       "sandton", "randburg", "rosebank", "hyde park", "dunkeld", "illovo",
@@ -64,6 +70,7 @@ const DELIVERY_ZONES = [
   {
     zoneNumber: 5,
     name: "Zone 5 - Extended (20-30km)",
+    maxKm: 30,
     fee: 450,
     suburbs: [
       "midrand", "kempton park", "isando", "rhodesfield", "bardene", "birchleigh",
@@ -80,6 +87,7 @@ const DELIVERY_ZONES = [
   {
     zoneNumber: 6,
     name: "Zone 6 - Very Far (30km+)",
+    maxKm: Infinity,
     fee: 500,
     suburbs: [
       "pretoria", "centurion", "krugersdorp", "randfontein", "westonaria",
@@ -92,6 +100,20 @@ const DELIVERY_ZONES = [
     ]
   }
 ];
+
+function haversineKm(lat1, lng1, lat2, lng2) {
+  const toRad = (deg) => (deg * Math.PI) / 180;
+  const R = 6371;
+  const dLat = toRad(lat2 - lat1);
+  const dLng = toRad(lng2 - lng1);
+  const s =
+    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+    Math.cos(toRad(lat1)) *
+      Math.cos(toRad(lat2)) *
+      Math.sin(dLng / 2) *
+      Math.sin(dLng / 2);
+  return 2 * R * Math.atan2(Math.sqrt(s), Math.sqrt(1 - s));
+}
 
 function normalize(str) {
   return String(str || "")
@@ -115,7 +137,29 @@ function findAllMatchingZones(address) {
   return matches;
 }
 
-function calculateZoneDetails(address) {
+function calculateZoneDetails(address, latitude, longitude) {
+  const lat = Number(latitude);
+  const lng = Number(longitude);
+  if (
+    Number.isFinite(lat) &&
+    Number.isFinite(lng) &&
+    lat < -22 &&
+    lat > -35 &&
+    lng > 16 &&
+    lng < 33
+  ) {
+    // Estimate road distance from straight-line distance (~1.24x urban road factor)
+    const estRoadKm = haversineKm(BAKERY_COORDS.lat, BAKERY_COORDS.lng, lat, lng) * 1.24;
+    const matchedZone =
+      DELIVERY_ZONES.find((z) => estRoadKm <= z.maxKm) || DELIVERY_ZONES[DELIVERY_ZONES.length - 1];
+    return {
+      fee: matchedZone.fee,
+      zone: matchedZone.name,
+      found: true,
+      zoneNumber: matchedZone.zoneNumber
+    };
+  }
+
   const matches = findAllMatchingZones(address);
   if (matches.length === 0) {
     return {
@@ -135,8 +179,8 @@ function calculateZoneDetails(address) {
 }
 
 // Returns { fee, zone, found } — backwards-compatible helper.
-function calculateZoneFee(address) {
-  const { fee, zone, found } = calculateZoneDetails(address);
+function calculateZoneFee(address, latitude, longitude) {
+  const { fee, zone, found } = calculateZoneDetails(address, latitude, longitude);
   return { fee, zone, found };
 }
 
