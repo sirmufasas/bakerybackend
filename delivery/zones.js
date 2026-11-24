@@ -185,4 +185,10 @@ function calculateZoneFee(address, latitude, longitude) {
   return { fee, zone, found };
 }
 
-module.exports = { DELIVERY_ZONES, calculateZoneFee, calculateZoneDetails };
+module.exports = {
+  BAKERY_OFFICIAL_ADDRESS,
+  BAKERY_COORDS,
+  DELIVERY_ZONES,
+  calculateZoneFee,
+  calculateZoneDetails
+};

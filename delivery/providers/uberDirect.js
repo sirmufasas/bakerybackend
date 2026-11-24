@@ -133,10 +133,12 @@ const uberDirect = {
         body.dropoff_latitude = context.latitude;
         body.dropoff_longitude = context.longitude;
       }
-      if (process.env.PORTUGAL_BAKERY_PICKUP_LAT && process.env.PORTUGAL_BAKERY_PICKUP_LNG) {
-        body.pickup_latitude = Number(process.env.PORTUGAL_BAKERY_PICKUP_LAT);
-        body.pickup_longitude = Number(process.env.PORTUGAL_BAKERY_PICKUP_LNG);
-      }
+      body.pickup_latitude = process.env.PORTUGAL_BAKERY_PICKUP_LAT
+        ? Number(process.env.PORTUGAL_BAKERY_PICKUP_LAT)
+        : -26.24144;
+      body.pickup_longitude = process.env.PORTUGAL_BAKERY_PICKUP_LNG
+        ? Number(process.env.PORTUGAL_BAKERY_PICKUP_LNG)
+        : 28.05526;
 
       const quote = await uberFetch(`/customers/${customerId}/delivery_quotes`, {
         method: 'POST',

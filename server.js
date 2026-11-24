@@ -11,6 +11,7 @@ const rateLimit = require('express-rate-limit');
 const helmet = require('helmet');
 const { body, param, query, validationResult } = require('express-validator');
 const deliveryEngine = require('./delivery/engine');
+const deliveryEta = require('./delivery/eta');
 const paymentEngine = require('./payments/engine');
 
 const app = express();
@@ -1208,7 +1209,17 @@ async function finalizePaidOrderFromSession(sessionDoc, verificationResult) {
     trackingUrl: null,
     driverDetails: null,
     pickupLocation: orderDraft.pickupLocation || null,
-    estimatedDelivery: null,
+    estimatedDelivery:
+      orderDraft.deliveryMethod === 'delivery'
+        ? deliveryEta.computeRealisticProviderEta({
+            providerId: orderDraft.deliveryProvider || 'own_delivery',
+            latitude: orderDraft.customerLat,
+            longitude: orderDraft.customerLng,
+            itemCount: Array.isArray(orderDraft.items)
+              ? orderDraft.items.reduce((s, it) => s + (Number(it?.quantity) || 1), 0)
+              : 2,
+          }).estimatedArrivalEnd
+        : null,
     courierRequestedAt: null,
     driverAssignedAt: null,
     pickedUpAt: null,
@@ -1767,7 +1778,7 @@ app.get('/api/delivery/providers', authenticateToken, async (req, res) => {
 // Get live delivery quotes for a candidate address/cart, compared across
 // every enabled + configured + eligible provider. Never called with an
 // order yet - this is purely for checkout-time comparison.
-app.post('/api/delivery/quotes', authenticateToken, [
+app.post('/api/delivery/quotes', [
   body('address').trim().notEmpty(),
   body('items').optional().isArray(),
   body('subtotal').optional().isFloat({ min: 0 })
@@ -1896,12 +1907,23 @@ app.get('/api/delivery/route', async (req, res) => {
         modifier: s.maneuver?.modifier || null,
       }));
 
+    const distKm = Math.round((routeData.distance / 1000) * 100) / 100;
+    const liveTraffic = deliveryEta.getLiveJhbTraffic(new Date());
+    const intersectionBufferMin = Math.min(8, Math.max(1.2, distKm * 0.35));
+    const realisticDriveMinutes = Math.max(
+      3,
+      Math.round((routeData.duration / 60 + intersectionBufferMin) * liveTraffic.factor + 2)
+    );
+
     res.json({
       origin: [BAKERY_ORIGIN_LAT, BAKERY_ORIGIN_LNG],
       destination: [destLat, destLng],
       resolvedLabel,
-      distanceKm: Math.round((routeData.distance / 1000) * 100) / 100,
-      durationMinutes: Math.max(4, Math.round(routeData.duration / 60)),
+      distanceKm: distKm,
+      rawDurationSeconds: Math.round(routeData.duration || 0),
+      durationMinutes: realisticDriveMinutes,
+      trafficFactor: liveTraffic.factor,
+      trafficLabel: liveTraffic.label,
       coordinates,
       steps,
     });

@@ -10,6 +10,7 @@
 //     when provider API credentials are present in environment variables.
 
 const { calculateZoneDetails } = require('../zones');
+const { computeRealisticProviderEta } = require('../eta');
 
 function createRateCardProvider(config) {
   const {
@@ -66,12 +67,22 @@ function createRateCardProvider(config) {
       return { available: true };
     },
 
-    async getQuote({ address, latitude, longitude }) {
+    async getQuote({ address, latitude, longitude, items = [] }) {
       const { zone, found, zoneNumber } = calculateZoneDetails(address, latitude, longitude);
       if (zoneNumber > maxZone) return null;
 
       const fee = zoneFees[zoneNumber] ?? zoneFees[6];
-      const [etaMinutesMin, etaMinutesMax] = zoneEtas[zoneNumber] || zoneEtas[6] || [60, 180];
+      const itemCount = Array.isArray(items)
+        ? items.reduce((sum, it) => sum + (Number(it?.quantity) || 1), 0)
+        : 2;
+
+      const liveEta = computeRealisticProviderEta({
+        providerId: this.id,
+        zoneNumber,
+        latitude,
+        longitude,
+        itemCount,
+      });
 
       return {
         providerId: this.id,
@@ -82,8 +93,15 @@ function createRateCardProvider(config) {
         dispatchMode: this.getDispatchMode(),
         fee,
         currency: 'ZAR',
-        etaMinutesMin,
-        etaMinutesMax,
+        etaMinutesMin: liveEta.etaMinutesMin,
+        etaMinutesMax: liveEta.etaMinutesMax,
+        driveMinutes: liveEta.driveMinutes,
+        prepMinutes: liveEta.prepMinutes,
+        pickupMinutes: liveEta.pickupMinutes,
+        trafficLabel: liveEta.trafficLabel,
+        storeOpenNow: liveEta.storeOpenNow,
+        estimatedArrivalStart: liveEta.estimatedArrivalStart,
+        estimatedArrivalEnd: liveEta.estimatedArrivalEnd,
         zone,
         addressRecognized: found,
         serviceType: this.serviceType,
