@@ -1356,7 +1356,7 @@ app.post(
         shippingAddress:
           deliveryMethod === 'delivery'
             ? (shippingAddress || customerAddress).trim()
-            : 'Store Pickup - 245 Johannesburg Road, La Rochelle',
+            : 'Store Pickup - 245 Johannesburg Rd, La Rochelle, Johannesburg South, 2190',
         specialInstructions: (specialInstructions || '').trim(),
         deliveryMethod,
         deliveryFee: pricing.deliveryFee,
@@ -1785,9 +1785,11 @@ app.post('/api/delivery/quotes', authenticateToken, [
   }
 });
 
-// Live street-level road routing & geocoding endpoint (origin: Portugal Bakery La Rochelle)
-const BAKERY_ORIGIN_LAT = -26.2425;
-const BAKERY_ORIGIN_LNG = 28.0558;
+// Live street-level road routing & geocoding endpoint
+// Official Starting Point: 245 Johannesburg Rd, La Rochelle, Johannesburg South, 2190
+const BAKERY_OFFICIAL_ADDRESS = '245 Johannesburg Rd, La Rochelle, Johannesburg South, 2190';
+const BAKERY_ORIGIN_LAT = -26.24144;
+const BAKERY_ORIGIN_LNG = 28.05526;
 
 app.get('/api/delivery/route', async (req, res) => {
   try {

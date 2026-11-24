@@ -3,7 +3,8 @@
 // Single source of truth for distance/zone tiers around Portugal Bakery
 // (245 Johannesburg Rd, La Rochelle, Johannesburg South, 2190).
 
-const BAKERY_COORDS = { lat: -26.2425, lng: 28.0558 };
+const BAKERY_OFFICIAL_ADDRESS = "245 Johannesburg Rd, La Rochelle, Johannesburg South, 2190";
+const BAKERY_COORDS = { lat: -26.24144, lng: 28.05526 };
 
 const DELIVERY_ZONES = [
   {
