@@ -1779,6 +1779,129 @@ app.post('/api/delivery/quotes', authenticateToken, [
   }
 });
 
+// Live street-level road routing & geocoding endpoint (origin: Portugal Bakery La Rochelle)
+const BAKERY_ORIGIN_LAT = -26.2425;
+const BAKERY_ORIGIN_LNG = 28.0558;
+
+app.get('/api/delivery/route', async (req, res) => {
+  try {
+    const rawAddress = String(req.query.address || '').trim();
+    let destLat = parseFloat(req.query.lat);
+    let destLng = parseFloat(req.query.lng);
+    let resolvedLabel = rawAddress;
+
+    // 1. Geocode street address if exact coordinates weren't passed
+    if ((Number.isNaN(destLat) || Number.isNaN(destLng)) && rawAddress) {
+      const searchQ = rawAddress.toLowerCase().includes('south africa')
+        ? rawAddress
+        : `${rawAddress}, Gauteng, South Africa`;
+
+      try {
+        const photonRes = await fetch(
+          `https://photon.komoot.io/api/?q=${encodeURIComponent(searchQ)}&lat=-26.2041&lon=28.0473&limit=3`,
+          { headers: { Accept: 'application/json', 'User-Agent': 'PortugalBakeryPortal/1.0' } }
+        );
+        if (photonRes.ok) {
+          const photonData = await photonRes.json();
+          const match = (photonData.features || []).find((f) => {
+            const [lon, lat] = f?.geometry?.coordinates || [];
+            return lat < -24.0 && lat > -28.0 && lon > 26.0 && lon < 30.0;
+          });
+          if (match) {
+            destLng = match.geometry.coordinates[0];
+            destLat = match.geometry.coordinates[1];
+            resolvedLabel = [match.properties?.housenumber, match.properties?.street || match.properties?.name, match.properties?.district || match.properties?.city]
+              .filter(Boolean)
+              .join(', ') || rawAddress;
+          }
+        }
+      } catch {
+        // Fallback to Nominatim below
+      }
+
+      if (Number.isNaN(destLat) || Number.isNaN(destLng)) {
+        try {
+          const nomRes = await fetch(
+            `https://nominatim.openstreetmap.org/search?format=json&countrycodes=za&limit=1&q=${encodeURIComponent(searchQ)}`,
+            { headers: { Accept: 'application/json', 'User-Agent': 'PortugalBakeryPortal/1.0 (https://portubakery.netlify.app)' } }
+          );
+          if (nomRes.ok) {
+            const nomData = await nomRes.json();
+            if (Array.isArray(nomData) && nomData[0]) {
+              const lat = parseFloat(nomData[0].lat);
+              const lon = parseFloat(nomData[0].lon);
+              if (lat < -24.0 && lat > -28.0 && lon > 26.0 && lon < 30.0) {
+                destLat = lat;
+                destLng = lon;
+                resolvedLabel = nomData[0].display_name || rawAddress;
+              }
+            }
+          }
+        } catch {
+          // Client fallback coordinates will be used if both fail
+        }
+      }
+    }
+
+    if (Number.isNaN(destLat) || Number.isNaN(destLng)) {
+      return res.status(404).json({ error: 'Could not geocode destination address.' });
+    }
+
+    // 2. Fetch real road geometry & turn-by-turn steps from FOSSGIS OSRM (primary) or Project OSRM (secondary)
+    const coordPair = `${BAKERY_ORIGIN_LNG},${BAKERY_ORIGIN_LAT};${destLng},${destLat}`;
+    const routerUrls = [
+      `https://routing.openstreetmap.de/routed-car/route/v1/driving/${coordPair}?overview=full&geometries=geojson&steps=true`,
+      `https://router.project-osrm.org/route/v1/driving/${coordPair}?overview=full&geometries=geojson&steps=true`,
+    ];
+
+    let routeData = null;
+    for (const url of routerUrls) {
+      try {
+        const r = await fetch(url, {
+          headers: { Accept: 'application/json', 'User-Agent': 'PortugalBakeryPortal/1.0' },
+        });
+        if (r.ok) {
+          const parsed = await r.json();
+          if (parsed?.routes?.[0]?.geometry?.coordinates?.length > 1) {
+            routeData = parsed.routes[0];
+            break;
+          }
+        }
+      } catch {
+        // try next router mirror
+      }
+    }
+
+    if (!routeData) {
+      return res.status(502).json({ error: 'Routing engines temporarily unavailable.' });
+    }
+
+    const coordinates = routeData.geometry.coordinates.map(([lng, lat]) => [lat, lng]);
+    const steps = (routeData.legs?.[0]?.steps || [])
+      .filter((s) => (s.distance || 0) >= 35 || s.maneuver?.type === 'arrive')
+      .map((s) => ({
+        road: s.name || s.ref || 'Local road',
+        ref: s.ref || null,
+        distanceMeters: Math.round(s.distance || 0),
+        durationSeconds: Math.round(s.duration || 0),
+        type: s.maneuver?.type || 'continue',
+        modifier: s.maneuver?.modifier || null,
+      }));
+
+    res.json({
+      origin: [BAKERY_ORIGIN_LAT, BAKERY_ORIGIN_LNG],
+      destination: [destLat, destLng],
+      resolvedLabel,
+      distanceKm: Math.round((routeData.distance / 1000) * 100) / 100,
+      durationMinutes: Math.max(4, Math.round(routeData.duration / 60)),
+      coordinates,
+      steps,
+    });
+  } catch (error) {
+    handleError(res, error, 'Failed to compute street route');
+  }
+});
+
 // Admin: view/update which providers are enabled + delivery business rules.
 app.get('/api/admin/delivery-settings', authenticateAdmin, async (req, res) => {
   try {
