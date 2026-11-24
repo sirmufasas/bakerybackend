@@ -11,6 +11,7 @@ const rateLimit = require('express-rate-limit');
 const helmet = require('helmet');
 const { body, param, query, validationResult } = require('express-validator');
 const deliveryEngine = require('./delivery/engine');
+const paymentEngine = require('./payments/engine');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -61,8 +62,13 @@ const createIndexes = async () => {
     await db.collection('users').createIndex({ email: 1 }, { unique: true });
     await db.collection('orders').createIndex({ userId: 1 });
     await db.collection('orders').createIndex({ orderNumber: 1 }, { unique: true });
+    await db.collection('orders').createIndex({ paymentReference: 1 }, { unique: true, sparse: true });
     await db.collection('orders').createIndex({ status: 1 });
     await db.collection('orders').createIndex({ createdAt: -1 });
+    await db.collection('payment_sessions').createIndex({ reference: 1 }, { unique: true });
+    await db.collection('payment_sessions').createIndex({ checkoutId: 1 }, { sparse: true });
+    await db.collection('payment_sessions').createIndex({ userId: 1 });
+    await db.collection('payment_sessions').createIndex({ createdAt: -1 });
     await db.collection('support_messages').createIndex({ userId: 1 });
     await db.collection('support_messages').createIndex({ createdAt: -1 });
     await db.collection('messages').createIndex({ orderId: 1 });
@@ -79,17 +85,32 @@ const createIndexes = async () => {
 
 // Middleware
 app.use(helmet());
+const allowedStaticOrigins = new Set([
+  process.env.FRONTEND_URL,
+  "https://portubakery.netlify.app",
+  "capacitor://localhost",
+  "http://localhost",
+  "http://localhost:8080",
+  "http://localhost:5173",
+  "http://localhost:3000"
+].filter(Boolean));
+
 app.use(
   cors({
-    origin: [
-      process.env.FRONTEND_URL,     // Netlify live site
-      "https://portubakery.netlify.app", // (just in case)
-      "capacitor://localhost",       // Android Capacitor app
-      "http://localhost",           // Android WebView fallback
-      "http://localhost:8080",      // local dev
-      "http://localhost:5173",      // local dev
-      "http://localhost:3000"       // local fallback
-    ],
+    origin: (origin, callback) => {
+      if (!origin || allowedStaticOrigins.has(origin)) {
+        return callback(null, true);
+      }
+      try {
+        const host = new URL(origin).hostname.toLowerCase();
+        if (host.endsWith('.netlify.app') || host.endsWith('.e2b.app')) {
+          return callback(null, true);
+        }
+      } catch {
+        // ignore invalid origin
+      }
+      return callback(new Error('Not allowed by CORS'));
+    },
     credentials: true,
   })
 );
@@ -1062,14 +1083,454 @@ app.delete('/api/cart', authenticateToken, async (req, res) => {
 });
 
 
+// ==================== GLOBAL PORTAL THEME SETTINGS (ADMIN-ONLY MUTATION) ====================
+
+const VALID_PORTAL_THEME_IDS = new Set([
+  'auto',
+  'summer',
+  'autumn',
+  'winter',
+  'spring',
+  'festive_summer',
+  'new_year',
+  'valentines',
+  'human_rights_day',
+  'easter',
+  'freedom_day',
+  'workers_day',
+  'mothers_day',
+  'youth_day',
+  'mandela_day',
+  'womens_day',
+  'heritage_day',
+  'reconciliation_day',
+]);
+
+// Public read so all customers/visitors automatically see the active SA event/season or Admin theme
+app.get('/api/settings/theme', async (req, res) => {
+  try {
+    const doc = await db.collection('site_settings').findOne({ key: 'portal_theme' });
+    res.json({
+      themeMode: doc?.themeMode && VALID_PORTAL_THEME_IDS.has(doc.themeMode) ? doc.themeMode : 'auto',
+      updatedAt: doc?.updatedAt || null,
+    });
+  } catch (error) {
+    res.json({ themeMode: 'auto', updatedAt: null });
+  }
+});
+
+// Admin-only write — normal users CANNOT change portal themes
+app.put(
+  '/api/admin/settings/theme',
+  authenticateAdmin,
+  [body('themeMode').isString().trim().notEmpty()],
+  validate,
+  async (req, res) => {
+    try {
+      const themeMode = String(req.body.themeMode || 'auto').trim();
+      if (!VALID_PORTAL_THEME_IDS.has(themeMode)) {
+        return res.status(400).json({ error: 'Invalid South African event or season theme ID.' });
+      }
+
+      const now = new Date();
+      await db.collection('site_settings').updateOne(
+        { key: 'portal_theme' },
+        {
+          $set: {
+            key: 'portal_theme',
+            themeMode,
+            updatedBy: req.user._id,
+            updatedAt: now,
+          },
+        },
+        { upsert: true }
+      );
+
+      res.json({ themeMode, updatedAt: now });
+    } catch (error) {
+      handleError(res, error, 'Failed to update portal theme setting');
+    }
+  }
+);
+
+
+// ==================== YOCO ONLINE CHECKOUT ENDPOINTS (CAPITEC ZAR SETTLEMENT) ====================
+
+/**
+ * Idempotently finalize a verified Yoco payment session into a confirmed, paid MongoDB order.
+ * Safe against concurrent redirect verification + Yoco webhook delivery.
+ */
+async function finalizePaidOrderFromSession(sessionDoc, verificationResult) {
+  const existingOrder = await db.collection('orders').findOne({
+    paymentReference: sessionDoc.reference,
+  });
+  if (existingOrder) {
+    return existingOrder;
+  }
+
+  const orderDraft = sessionDoc.orderPayload;
+  const userDoc = await db.collection('users').findOne(
+    { _id: new ObjectId(sessionDoc.userId) },
+    { projection: { password: 0 } }
+  );
+
+  const order = {
+    userId: new ObjectId(sessionDoc.userId),
+    orderNumber: generateOrderNumber(),
+    status: 'pending',
+    paymentStatus: 'paid',
+    paymentGateway: 'yoco',
+    paymentReference: sessionDoc.reference,
+    paymentID: verificationResult.gatewayTransactionId || sessionDoc.checkoutId || sessionDoc.reference,
+    paymentChannel: verificationResult.channel || 'yoco_checkout',
+    paidAt: verificationResult.paidAt || new Date(),
+    customerName: orderDraft.customerName || `${userDoc?.firstName || ''} ${userDoc?.lastName || ''}`.trim(),
+    customerEmail: orderDraft.customerEmail || userDoc?.email || '',
+    items: orderDraft.items,
+    totalAmount: orderDraft.totalAmount,
+    phone: orderDraft.customerPhone,
+    address: orderDraft.deliveryMethod === 'delivery' ? orderDraft.customerAddress : '',
+    deliveryMethod: orderDraft.deliveryMethod,
+    deliveryFee: orderDraft.deliveryFee || 0,
+    deliveryZone: orderDraft.deliveryZone || '',
+    shippingAddress: orderDraft.shippingAddress || orderDraft.customerAddress || '',
+    specialInstructions: orderDraft.specialInstructions || '',
+    deliveryProvider: orderDraft.deliveryMethod === 'delivery'
+      ? (orderDraft.deliveryProvider || 'own_delivery')
+      : null,
+    deliveryService: orderDraft.deliveryMethod === 'delivery'
+      ? (orderDraft.deliveryService || null)
+      : null,
+    deliveryQuoteId: orderDraft.deliveryQuoteId || null,
+    providerDeliveryId: null,
+    trackingUrl: null,
+    driverDetails: null,
+    pickupLocation: orderDraft.pickupLocation || null,
+    estimatedDelivery: null,
+    courierRequestedAt: null,
+    driverAssignedAt: null,
+    pickedUpAt: null,
+    deliveredAt: null,
+    deliveryFailureReason: null,
+    createdAt: new Date(),
+    updatedAt: new Date(),
+  };
+
+  try {
+    const result = await db.collection('orders').insertOne(order);
+    order._id = result.insertedId;
+  } catch (err) {
+    if (err && err.code === 11000) {
+      const concurrent = await db.collection('orders').findOne({
+        paymentReference: sessionDoc.reference,
+      });
+      if (concurrent) return concurrent;
+    }
+    throw err;
+  }
+
+  await db.collection('payment_sessions').updateOne(
+    { _id: sessionDoc._id },
+    {
+      $set: {
+        status: 'completed',
+        orderId: order._id,
+        orderNumber: order.orderNumber,
+        gatewayTransactionId: verificationResult.gatewayTransactionId,
+        paymentChannel: verificationResult.channel,
+        gatewaySummary: verificationResult.rawSummary || null,
+        verifiedAt: new Date(),
+        updatedAt: new Date(),
+      },
+    }
+  );
+
+  // Clear customer's persisted cart
+  await db.collection('carts').updateOne(
+    { userId: new ObjectId(sessionDoc.userId) },
+    { $set: { items: [], updatedAt: new Date() } },
+    { upsert: true }
+  );
+
+  // Send confirmation email asynchronously
+  sendOrderConfirmationEmail(order).catch((e) =>
+    console.error('Email error:', e)
+  );
+
+  // Broadcast live order to Admin dashboard SSE
+  broadcastToAdmins({
+    type: 'new_order',
+    order: {
+      ...order,
+      _id: order._id.toString(),
+      userId: order.userId.toString(),
+      user: [{
+        firstName: userDoc?.firstName || orderDraft.customerName || 'Customer',
+        lastName: userDoc?.lastName || '',
+        email: userDoc?.email || orderDraft.customerEmail || '',
+      }],
+    },
+  });
+
+  console.log(`✅ Verified YOCO payment -> Order ${order.orderNumber} (R${order.totalAmount.toFixed(2)})`);
+  return order;
+}
+
+// Public Yoco payment gateway configuration
+app.get('/api/payments/config', (req, res) => {
+  res.json(paymentEngine.getGatewayConfig());
+});
+
+// Initialize a server-verified Yoco Hosted Checkout session (ZAR cents)
+app.post(
+  '/api/payments/initialize',
+  authenticateToken,
+  [
+    body('items').isArray({ min: 1 }),
+    body('customerPhone').trim().notEmpty(),
+    body('deliveryMethod').isIn(['delivery', 'pickup']),
+    body('customerAddress').custom((value, { req }) => {
+      if (req.body.deliveryMethod === 'delivery' && !value?.trim()) {
+        throw new Error('Delivery address is required for delivery orders');
+      }
+      return true;
+    }),
+  ],
+  validate,
+  async (req, res) => {
+    try {
+      const gatewayConfig = paymentEngine.getGatewayConfig();
+      if (!gatewayConfig.configured) {
+        return res.status(503).json({
+          error:
+            'Yoco online payment gateway is awaiting YOCO_SECRET_KEY in Render environment variables.',
+        });
+      }
+
+      const {
+        items,
+        customerName,
+        customerEmail,
+        customerPhone,
+        customerAddress,
+        shippingAddress,
+        specialInstructions,
+        deliveryMethod,
+        deliveryFee,
+        deliveryZone,
+        deliveryProvider,
+        deliveryService,
+        deliveryQuoteId,
+        pickupLocation,
+        returnOrigin,
+      } = req.body;
+
+      // Server-side item & delivery verification (prevents price tampering)
+      const pricing = await paymentEngine.calculateVerifiedOrderPricing(
+        db,
+        items,
+        deliveryMethod,
+        deliveryFee
+      );
+
+      const reference = paymentEngine.generatePaymentReference();
+      const safeOrigin = paymentEngine.resolveSafeReturnOrigin(
+        returnOrigin || req.headers.origin
+      );
+      const payerEmail = (customerEmail || req.user.email || '').trim();
+      if (!payerEmail) {
+        return res.status(400).json({ error: 'A valid customer email is required for payment receipts.' });
+      }
+
+      const orderPayload = {
+        customerName: (customerName || `${req.user.firstName || ''} ${req.user.lastName || ''}`).trim(),
+        customerEmail: payerEmail,
+        customerPhone: customerPhone.trim(),
+        customerAddress: deliveryMethod === 'delivery' ? customerAddress.trim() : '',
+        shippingAddress:
+          deliveryMethod === 'delivery'
+            ? (shippingAddress || customerAddress).trim()
+            : 'Store Pickup - 245 Johannesburg Road, La Rochelle',
+        specialInstructions: (specialInstructions || '').trim(),
+        deliveryMethod,
+        deliveryFee: pricing.deliveryFee,
+        deliveryZone: deliveryZone || '',
+        deliveryProvider: deliveryMethod === 'delivery' ? (deliveryProvider || 'own_delivery') : null,
+        deliveryService: deliveryMethod === 'delivery' ? (deliveryService || null) : null,
+        deliveryQuoteId: deliveryQuoteId || null,
+        pickupLocation: pickupLocation || null,
+        items: pricing.verifiedItems,
+        subtotal: pricing.subtotal,
+        totalAmount: pricing.total,
+      };
+
+      const successUrl = `${safeOrigin}/order?payment_verify=yoco&reference=${encodeURIComponent(reference)}`;
+      const cancelUrl = `${safeOrigin}/order?payment_cancelled=1&reference=${encodeURIComponent(reference)}`;
+      const failureUrl = `${safeOrigin}/order?payment_failed=1&reference=${encodeURIComponent(reference)}`;
+
+      const checkoutSession = await paymentEngine.initializeYocoCheckout({
+        amountCents: pricing.amountCents,
+        subtotalCents: Math.round(pricing.subtotal * 100),
+        deliveryFeeCents: Math.round(pricing.deliveryFee * 100),
+        reference,
+        successUrl,
+        cancelUrl,
+        failureUrl,
+        metadata: {
+          userId: req.user._id.toString(),
+          customerName: orderPayload.customerName,
+          customerEmail: payerEmail,
+          customerPhone: orderPayload.customerPhone,
+          deliveryMethod,
+        },
+      });
+
+      await db.collection('payment_sessions').insertOne({
+        reference,
+        gateway: 'yoco',
+        checkoutId: checkoutSession.checkoutId,
+        userId: req.user._id,
+        amountCents: pricing.amountCents,
+        currency: 'ZAR',
+        status: 'pending',
+        orderPayload,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      });
+
+      res.json({
+        gateway: 'yoco',
+        reference,
+        checkoutId: checkoutSession.checkoutId,
+        redirectUrl: checkoutSession.redirectUrl,
+        amountCents: pricing.amountCents,
+        totalAmount: pricing.total,
+        currency: 'ZAR',
+      });
+    } catch (error) {
+      if (error.statusCode) {
+        return res.status(error.statusCode).json({ error: error.message });
+      }
+      handleError(res, error, 'Failed to initialize Yoco checkout');
+    }
+  }
+);
+
+// Verify a completed Yoco Hosted Checkout session directly with Yoco API & finalize order
+app.post(
+  '/api/payments/verify',
+  authenticateToken,
+  [body('reference').trim().notEmpty()],
+  validate,
+  async (req, res) => {
+    try {
+      const reference = String(req.body.reference || '').trim();
+      const sessionDoc = await db.collection('payment_sessions').findOne({ reference });
+
+      if (!sessionDoc) {
+        return res.status(404).json({ error: 'Yoco payment session not found.' });
+      }
+
+      if (sessionDoc.userId.toString() !== req.user._id.toString() && req.user.role !== 'admin') {
+        return res.status(403).json({ error: 'Unauthorized payment session access.' });
+      }
+
+      const existingOrder = await db.collection('orders').findOne({ paymentReference: reference });
+      if (existingOrder) {
+        return res.json({ verified: true, status: 'completed', order: existingOrder });
+      }
+
+      const verification = await paymentEngine.verifyYocoCheckout(sessionDoc.checkoutId);
+
+      if (!verification.verified) {
+        await db.collection('payment_sessions').updateOne(
+          { _id: sessionDoc._id },
+          {
+            $set: {
+              status: verification.failed ? 'failed' : 'pending',
+              lastGatewayStatus: verification.gatewayStatus,
+              updatedAt: new Date(),
+            },
+          }
+        );
+        return res.status(402).json({
+          verified: false,
+          failed: verification.failed,
+          status: verification.gatewayStatus,
+          error: `Yoco payment is not yet completed (status: ${verification.gatewayStatus}).`,
+        });
+      }
+
+      if (verification.currency !== 'ZAR' || verification.amountCents < sessionDoc.amountCents) {
+        console.error('❌ Yoco payment amount/currency mismatch:', {
+          expectedCents: sessionDoc.amountCents,
+          receivedCents: verification.amountCents,
+          currency: verification.currency,
+        });
+        return res.status(400).json({ error: 'Verified Yoco payment amount did not match order total.' });
+      }
+
+      const order = await finalizePaidOrderFromSession(sessionDoc, verification);
+      res.json({ verified: true, status: verification.gatewayStatus, order });
+    } catch (error) {
+      if (error.statusCode) {
+        return res.status(error.statusCode).json({ error: error.message });
+      }
+      handleError(res, error, 'Yoco payment verification failed');
+    }
+  }
+);
+
+// Yoco Webhook (Svix HMAC-SHA256 verified when YOCO_WEBHOOK_SECRET is set)
+app.post('/api/payments/webhook/yoco', async (req, res) => {
+  try {
+    if (process.env.YOCO_WEBHOOK_SECRET) {
+      const valid = paymentEngine.verifyYocoWebhookSignature(req.rawBody, req.headers);
+      if (!valid) {
+        return res.status(401).json({ error: 'Invalid Yoco webhook signature' });
+      }
+    }
+
+    const event = req.body || {};
+    if (event.type === 'payment.succeeded') {
+      const metadataRef = event.payload?.metadata?.reference;
+      const checkoutId =
+        event.payload?.metadata?.checkoutId || event.payload?.checkoutId;
+
+      const sessionDoc = metadataRef
+        ? await db.collection('payment_sessions').findOne({ reference: String(metadataRef) })
+        : checkoutId
+        ? await db.collection('payment_sessions').findOne({ checkoutId: String(checkoutId) })
+        : null;
+
+      if (sessionDoc && sessionDoc.checkoutId) {
+        const verification = await paymentEngine.verifyYocoCheckout(sessionDoc.checkoutId);
+        if (
+          verification.verified &&
+          verification.currency === 'ZAR' &&
+          verification.amountCents >= sessionDoc.amountCents
+        ) {
+          await finalizePaidOrderFromSession(sessionDoc, verification);
+        }
+      }
+    }
+
+    res.status(200).json({ received: true });
+  } catch (error) {
+    console.error('Yoco webhook error:', error);
+    res.status(500).json({ error: 'Webhook processing error' });
+  }
+});
+
+
 // ==================== ORDER ENDPOINTS ====================
 
 app.post('/api/orders', authenticateToken, [
   body('items').isArray({ min: 1 }),
   body('totalAmount').isFloat({ min: 0 }),
   body('customerPhone').trim().notEmpty(),
-  body('deliveryMethod').isIn(['delivery', 'pickup']), // ✅ ADDED
-  // Only require address if delivery method is 'delivery'
+  body('deliveryMethod').isIn(['delivery', 'pickup']),
+  body('paymentReference').trim().notEmpty().withMessage('Verified online payment reference is required'),
   body('customerAddress').custom((value, { req }) => {
     if (req.body.deliveryMethod === 'delivery' && !value?.trim()) {
       throw new Error('Delivery address is required for delivery orders');
@@ -1078,111 +1539,34 @@ app.post('/api/orders', authenticateToken, [
   })
 ], validate, async (req, res) => {
   try {
-    const {
-      items,
-      totalAmount,
-      shippingAddress,
-      specialInstructions,
-      customerPhone,
-      customerAddress,
-      deliveryMethod  // ✅ ADDED
-    } = req.body;
+    const paymentReference = String(req.body.paymentReference || '').trim();
+    const existingOrder = await db.collection('orders').findOne({
+      paymentReference,
+      userId: req.user._id,
+    });
+    if (existingOrder) {
+      return res.json(existingOrder);
+    }
 
-    const itemsSubtotal = items.reduce((sum, i) => sum + (i.price * i.quantity), 0);
+    const sessionDoc = await db.collection('payment_sessions').findOne({
+      reference: paymentReference,
+      userId: req.user._id,
+    });
 
-    const deliveryFee = req.body.deliveryFee || 0;
-    const expectedTotal = Math.round((itemsSubtotal + deliveryFee) * 100) / 100;
-    const receivedTotal = Math.round(totalAmount * 100) / 100;
-
-    // Allow small rounding differences (increased tolerance)
-    if (Math.abs(expectedTotal - receivedTotal) > 0.02) {
-      console.error('❌ Total mismatch:', {
-        itemsSubtotal,
-        deliveryFee,
-        expectedTotal,
-        receivedTotal,
-        difference: Math.abs(expectedTotal - receivedTotal)
-      });
-      return res.status(400).json({
-        error: 'Total mismatch',
-        details: {
-          expected: expectedTotal,
-          received: receivedTotal,
-          itemsSubtotal,
-          deliveryFee
-        }
+    if (!sessionDoc || sessionDoc.status !== 'completed') {
+      return res.status(402).json({
+        error: 'Verified online gateway payment is required before creating an order.',
       });
     }
 
-    const order = {
-      userId: req.user._id,
-      orderNumber: generateOrderNumber(),
-      status: 'pending',
-      paymentStatus: req.body.paymentID ? 'paid' : 'pending',
-      paymentID: req.body.paymentID || null,
-      items,
-      totalAmount,
-      phone: customerPhone,
-      address: deliveryMethod === 'delivery' ? customerAddress : '',
-      deliveryMethod,
-      deliveryFee: req.body.deliveryFee || 0,  // ✅ ADD THIS
-      deliveryZone: req.body.deliveryZone || '',  // ✅ ADD THIS
-      shippingAddress: shippingAddress || customerAddress,
-      specialInstructions: specialInstructions || '',
+    const finalized = await db.collection('orders').findOne({ paymentReference });
+    if (finalized) {
+      return res.json(finalized);
+    }
 
-      // Delivery engine fields - populated at checkout (provider selection)
-      // and later by staff (courier request/tracking). All null/empty for
-      // pickup orders and for orders that haven't been dispatched yet.
-      deliveryProvider: deliveryMethod === 'delivery' ? (req.body.deliveryProvider || 'own_delivery') : null,
-      deliveryService: deliveryMethod === 'delivery' ? (req.body.deliveryService || null) : null,
-      deliveryQuoteId: req.body.deliveryQuoteId || null,
-      providerDeliveryId: null,
-      trackingUrl: null,
-      driverDetails: null,
-      pickupLocation: req.body.pickupLocation || null, // for PUDO-style pickup-point orders
-      estimatedDelivery: null,
-      courierRequestedAt: null,
-      driverAssignedAt: null,
-      pickedUpAt: null,
-      deliveredAt: null,
-      deliveryFailureReason: null,
-
-      createdAt: new Date(),
-      updatedAt: new Date()
-    };
-
-    const result = await db.collection('orders').insertOne(order);
-    order._id = result.insertedId;
-
-    // Clear cart after order
-    await db.collection('carts').updateOne(
-      { userId: req.user._id },
-      { $set: { items: [], updatedAt: new Date() } },
-      { upsert: true }
-    );
-
-    // Send email
-    sendOrderConfirmationEmail(order).catch(e =>
-      console.error('Email error:', e)
-    );
-
-    // Broadcast to all admins
-    broadcastToAdmins({
-      type: 'new_order',
-      order: {
-        ...order,
-        _id: order._id.toString(),
-        userId: order.userId.toString(),
-        user: [{
-          firstName: req.user.firstName,
-          lastName: req.user.lastName,
-          email: req.user.email
-        }]
-      }
+    return res.status(402).json({
+      error: 'Payment verification incomplete. Please verify your payment session.',
     });
-
-    console.log('✅ Order created:', order.orderNumber, '- Method:', deliveryMethod);
-    res.json(order);
   } catch (error) {
     handleError(res, error, 'Order creation failed');
   }
